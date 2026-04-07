@@ -1140,7 +1140,7 @@ void DumpCurrentGpsToCustomData()
     Echo("Dumped GPS/orientation to Custom Data.");
 }
 
-// ---- State persistence (Me.Storage) ----
+// ---- State persistence (Storage) ----
 
 string V3ToString(Vector3D v)
 {
@@ -1194,12 +1194,12 @@ void SaveState()
     sb.AppendLine("TOFFR=" + TOFFR.ToString("R"));
     sb.AppendLine("TOFFU=" + TOFFU.ToString("R"));
     sb.AppendLine("TOFFF=" + TOFFF.ToString("R"));
-    Me.Storage = sb.ToString();
+    Storage = sb.ToString();
 }
 
 void LoadState()
 {
-    string data = Me.Storage;
+    string data = Storage;
     if (string.IsNullOrWhiteSpace(data))
         return;
 
