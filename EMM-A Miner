@@ -81,6 +81,9 @@ double lastOreSnapshot = 0;
 double lastOreGainDepth = 0;
 int noOreGainTicks = 0;
 const int noOreGainTickLimit = 20;
+double cachedOreAmount = 0;
+int oreCheckTick = 0;
+const int oreCheckTickInterval = 20; // refresh ore total every 20 ticks (~0.33s at Update1)
 bool areaMiningMode = false;
 List<Vector3D> areaLaneAnchors = new List<Vector3D>();
 int areaLaneIndex = 0;
@@ -553,6 +556,9 @@ bool ExecutePathRecord(string rawRecord)
         return miningEnabled;
     }
 
+    // A GPS record that contains ";" is a shorthand minearea entry from the path timer.
+    // Path records are expected to drive area mining, so GPS:...<corners>;<orientation>;<depth>
+    // gets forwarded to StartAreaMining as if the user had typed "minearea;" in front of it.
     if (record.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase) && record.Contains(";"))
     {
         StartAreaMining("minearea;" + record);
@@ -689,7 +695,7 @@ void StartAreaMining(string command)
     Vector3D rightBottom;
     if (!TryParsePoint(args[1], out leftUpper) || !TryParsePoint(args[2], out rightBottom))
     {
-        Echo("Invalid orientation mode. Use Faceup,Faceforward or ux,uy,uz,fx,fy,fz");
+        Echo("Invalid point format. Use GPS:Name:X:Y:Z: or x,y,z");
         return;
     }
 
@@ -956,9 +962,11 @@ void ResetStuckMonitor()
 
 void ResetDepthAutoTracker()
 {
-    lastOreSnapshot = GetOreAmount(depthMode == DepthMode.OrePlusStone);
+    cachedOreAmount = GetOreAmount(depthMode == DepthMode.OrePlusStone);
+    lastOreSnapshot = cachedOreAmount;
     lastOreGainDepth = 0;
     noOreGainTicks = 0;
+    oreCheckTick = 0;
 }
 
 double GetLaneProgressDepth()
@@ -980,7 +988,16 @@ bool ShouldFinishDrillForward()
         return depthProgress >= laneDepth || IsAtTargetPosition(targetPosition);
 
     bool includeStone = depthMode == DepthMode.OrePlusStone;
-    double oreNow = GetOreAmount(includeStone);
+    if (oreCheckTick <= 0)
+    {
+        cachedOreAmount = GetOreAmount(includeStone);
+        oreCheckTick = oreCheckTickInterval;
+    }
+    else
+    {
+        oreCheckTick--;
+    }
+    double oreNow = cachedOreAmount;
 
     if (oreNow > lastOreSnapshot + 0.01)
     {
