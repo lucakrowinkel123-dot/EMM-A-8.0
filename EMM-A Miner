@@ -41,12 +41,14 @@ double TOFFR = 0; // target offset Right (m)
 double TOFFU = -2.5; // target offset Up (m)
 double TOFFF = 0; // target offset Forward (m)
 string pathTimerTag = "Path";
+string stoneEjectorTag = "StoneEject"; // name tag for conveyor sorters that eject stone
 // =============================================
 
 IMyShipController rc;
 ThrusterControl thrust;
 GyroControl gyros;
 List<IMyShipDrill> drills = new List<IMyShipDrill>();
+List<IMyConveyorSorter> stoneEjectors = new List<IMyConveyorSorter>();
 Vector3D targetPosition = Vector3D.Zero;
 bool hasTarget = false;
 bool autopilotEnabled = false;
@@ -116,6 +118,7 @@ public Program ()
     thrust = new ThrusterControl(rc, tickSpeed, GetBlocks<IMyThrust>());
     gyros = new GyroControl(rc, tickSpeed, GetBlocks<IMyGyro>());
     drills = GetBlocks<IMyShipDrill>();
+    stoneEjectors = GetBlocks<IMyConveyorSorter>().FindAll(s => s.CustomName.IndexOf(stoneEjectorTag, StringComparison.OrdinalIgnoreCase) >= 0);
 
     if (tickSpeed == UpdateFrequency.Update10)
         secondsPerTick = 10.0 / 60.0;
@@ -127,6 +130,7 @@ public Program ()
     else if (tickSpeed == UpdateFrequency.Update100)
         echoFrequency = 1;
 
+    LoadState();
     Echo("Ready.");
     Runtime.UpdateFrequency = tickSpeed;
 }
@@ -273,6 +277,7 @@ void RemoteCommand (string command)
         }
         hasTarget = true;
         autopilotEnabled = true;
+        SaveState();
         WriteEcho();
         return;
     }
@@ -284,6 +289,7 @@ void RemoteCommand (string command)
         {
             SPEEDF = v;
             Echo($"SPEEDF set to {SPEEDF:0.00} m/s");
+            SaveState();
         }
         else
             Echo("Invalid SPEEDF value.");
@@ -297,6 +303,7 @@ void RemoteCommand (string command)
         {
             SPEEDB = v;
             Echo($"SPEEDB set to {SPEEDB:0.00} m/s");
+            SaveState();
         }
         else
             Echo("Invalid SPEEDB value.");
@@ -309,6 +316,7 @@ void RemoteCommand (string command)
         {
             MINEH = v;
             Echo($"MINEH set to {MINEH:0.00} m");
+            SaveState();
         }
         else
             Echo("Invalid MINEH value.");
@@ -321,6 +329,7 @@ void RemoteCommand (string command)
         {
             MINEW = v;
             Echo($"MINEW set to {MINEW:0.00} m");
+            SaveState();
         }
         else
             Echo("Invalid MINEW value.");
@@ -341,6 +350,7 @@ void RemoteCommand (string command)
             return;
         }
         Echo($"DEPTHMODE set to {depthMode}");
+        SaveState();
         return;
     }
     if (trimmed.StartsWith("TOFF ", StringComparison.OrdinalIgnoreCase))
@@ -352,6 +362,7 @@ void RemoteCommand (string command)
             TOFFU = off.Y;
             TOFFF = off.Z;
             Echo($"TOFF set. R/U/F = {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
+            SaveState();
         }
         else
             Echo("Invalid TOFF. Use: TOFF r,u,f");
@@ -476,6 +487,7 @@ void RemoteCommand (string command)
                 StartAreaMining(trimmed);
             break;
     }
+    SaveState();
 }
 
 void UpdatePathRunner()
@@ -527,6 +539,7 @@ void StartNextPathRecord()
     {
         string record = pathRecords[pathIndex];
         pathIndex++;
+        SaveState();
         if (ExecutePathRecord(record))
             return;
         Echo($"Skipping invalid path record #{pathIndex}.");
@@ -535,6 +548,7 @@ void StartNextPathRecord()
     if (pathMode && pathIndex >= pathRecords.Count)
     {
         pathMode = false;
+        SaveState();
         Echo("Path execution complete.");
     }
 }
@@ -936,6 +950,7 @@ void UpdateMiningState()
                     laneAnchor = areaLaneAnchors[areaLaneIndex];
                     ResetDepthAutoTracker();
                     miningState = MiningState.EnterLane;
+                    SaveState();
                     Echo($"Proceeding to lane {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
                 }
                 else
@@ -947,6 +962,7 @@ void UpdateMiningState()
                     areaMiningMode = false;
                     areaLaneAnchors.Clear();
                     areaLaneIndex = 0;
+                    SaveState();
                     Echo("Mining operation complete.");
                 }
             }
@@ -1114,7 +1130,171 @@ void SetDrills(bool enabled)
             continue;
         d.Enabled = enabled;
     }
+    SetStoneEjectors(enabled);
 }
+
+void SetStoneEjectors(bool enabled)
+{
+    foreach (var s in stoneEjectors)
+    {
+        if (s == null || !s.IsFunctional)
+            continue;
+        s.Enabled = enabled;
+    }
+}
+
+// ========== State Persistence ==========
+
+string V3S(Vector3D v) => $"{v.X:R}:{v.Y:R}:{v.Z:R}";
+
+bool V3P(string s, out Vector3D v)
+{
+    v = Vector3D.Zero;
+    string[] p = s.Split(':');
+    if (p.Length != 3) return false;
+    double x, y, z;
+    if (!double.TryParse(p[0], out x) || !double.TryParse(p[1], out y) || !double.TryParse(p[2], out z)) return false;
+    v = new Vector3D(x, y, z);
+    return true;
+}
+
+void SaveState()
+{
+    var sb = new StringBuilder();
+    sb.AppendLine("v=1");
+    // autopilot
+    sb.AppendLine($"ap={autopilotEnabled}");
+    sb.AppendLine($"ht={hasTarget}");
+    sb.AppendLine($"tp={V3S(targetPosition)}");
+    sb.AppendLine($"df={V3S(desiredForward)}");
+    sb.AppendLine($"du={V3S(desiredUp)}");
+    sb.AppendLine($"ams={activeMaxSpeed}");
+    // mining
+    sb.AppendLine($"me={miningEnabled}");
+    sb.AppendLine($"ms={miningState}");
+    sb.AppendLine($"la={V3S(laneAnchor)}");
+    sb.AppendLine($"da={V3S(drillAxis)}");
+    sb.AppendLine($"ld={laneDepth}");
+    sb.AppendLine($"rlc={retryCurrentLane}");
+    // area mining
+    sb.AppendLine($"am={areaMiningMode}");
+    sb.AppendLine($"ali={areaLaneIndex}");
+    sb.AppendLine($"ala.count={areaLaneAnchors.Count}");
+    for (int i = 0; i < areaLaneAnchors.Count; i++)
+        sb.AppendLine($"ala.{i}={V3S(areaLaneAnchors[i])}");
+    // path
+    sb.AppendLine($"pm={pathMode}");
+    sb.AppendLine($"pp={pathPaused}");
+    sb.AppendLine($"ppnr={pathPausedNavResume}");
+    sb.AppendLine($"pi={pathIndex}");
+    sb.AppendLine($"pr.count={pathRecords.Count}");
+    for (int i = 0; i < pathRecords.Count; i++)
+        sb.AppendLine($"pr.{i}={pathRecords[i]}");
+    // settings
+    sb.AppendLine($"dm={depthMode}");
+    sb.AppendLine($"sf={SPEEDF}");
+    sb.AppendLine($"sb2={SPEEDB}");
+    sb.AppendLine($"mh={MINEH}");
+    sb.AppendLine($"mw={MINEW}");
+    sb.AppendLine($"tor={TOFFR}");
+    sb.AppendLine($"tou={TOFFU}");
+    sb.AppendLine($"tof={TOFFF}");
+
+    Me.Storage = sb.ToString();
+}
+
+void LoadState()
+{
+    if (string.IsNullOrWhiteSpace(Me.Storage))
+        return;
+
+    var dict = new Dictionary<string, string>();
+    foreach (string line in Me.Storage.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
+    {
+        int eq = line.IndexOf('=');
+        if (eq < 0) continue;
+        dict[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+    }
+
+    string val;
+    if (!dict.TryGetValue("v", out val) || val != "1") return;
+
+    // Settings — always restore regardless of operational state
+    double d;
+    DepthMode dm;
+    if (dict.TryGetValue("dm", out val) && Enum.TryParse(val, out dm)) depthMode = dm;
+    if (dict.TryGetValue("sf", out val) && double.TryParse(val, out d)) SPEEDF = d;
+    if (dict.TryGetValue("sb2", out val) && double.TryParse(val, out d)) SPEEDB = d;
+    if (dict.TryGetValue("mh", out val) && double.TryParse(val, out d)) MINEH = d;
+    if (dict.TryGetValue("mw", out val) && double.TryParse(val, out d)) MINEW = d;
+    if (dict.TryGetValue("tor", out val) && double.TryParse(val, out d)) TOFFR = d;
+    if (dict.TryGetValue("tou", out val) && double.TryParse(val, out d)) TOFFU = d;
+    if (dict.TryGetValue("tof", out val) && double.TryParse(val, out d)) TOFFF = d;
+
+    // Navigation
+    bool b;
+    Vector3D vec;
+    if (dict.TryGetValue("ht", out val) && bool.TryParse(val, out b)) hasTarget = b;
+    if (dict.TryGetValue("tp", out val) && V3P(val, out vec)) targetPosition = vec;
+    if (dict.TryGetValue("df", out val) && V3P(val, out vec)) desiredForward = vec;
+    if (dict.TryGetValue("du", out val) && V3P(val, out vec)) desiredUp = vec;
+    if (dict.TryGetValue("ams", out val) && double.TryParse(val, out d)) activeMaxSpeed = d;
+
+    // Mining geometry
+    if (dict.TryGetValue("la", out val) && V3P(val, out vec)) laneAnchor = vec;
+    if (dict.TryGetValue("da", out val) && V3P(val, out vec)) drillAxis = vec;
+    if (dict.TryGetValue("ld", out val) && double.TryParse(val, out d)) laneDepth = d;
+
+    // Area lanes
+    if (dict.TryGetValue("am", out val) && bool.TryParse(val, out b)) areaMiningMode = b;
+    int count;
+    if (dict.TryGetValue("ali", out val) && int.TryParse(val, out count)) areaLaneIndex = count;
+    if (dict.TryGetValue("ala.count", out val) && int.TryParse(val, out count))
+    {
+        areaLaneAnchors = new List<Vector3D>();
+        for (int i = 0; i < count; i++)
+        {
+            string key = $"ala.{i}";
+            if (dict.TryGetValue(key, out val) && V3P(val, out vec))
+                areaLaneAnchors.Add(vec);
+        }
+    }
+
+    // Path records
+    if (dict.TryGetValue("pm", out val) && bool.TryParse(val, out b)) pathMode = b;
+    if (dict.TryGetValue("pp", out val) && bool.TryParse(val, out b)) pathPaused = b;
+    if (dict.TryGetValue("ppnr", out val) && bool.TryParse(val, out b)) pathPausedNavResume = b;
+    if (dict.TryGetValue("pi", out val) && int.TryParse(val, out count)) pathIndex = count;
+    if (dict.TryGetValue("pr.count", out val) && int.TryParse(val, out count))
+    {
+        pathRecords = new List<string>();
+        for (int i = 0; i < count; i++)
+        {
+            string key = $"pr.{i}";
+            if (dict.TryGetValue(key, out val)) pathRecords.Add(val);
+        }
+    }
+
+    // Mining state — always re-enter from EnterLane so the ship re-approaches
+    // the anchor safely rather than trying to resume mid-drill.
+    if (dict.TryGetValue("me", out val) && bool.TryParse(val, out b) && b)
+    {
+        miningEnabled = true;
+        miningState = MiningState.EnterLane;
+        targetPosition = laneAnchor;
+        hasTarget = true;
+        autopilotEnabled = true;
+        Echo("Resumed: returning to lane anchor.");
+    }
+    else if (dict.TryGetValue("ap", out val) && bool.TryParse(val, out b))
+    {
+        autopilotEnabled = b;
+        if (autopilotEnabled)
+            Echo("Resumed: autopilot re-enabled.");
+    }
+}
+
+// ========================================
 
 void DumpCurrentGpsToCustomData()
 {
