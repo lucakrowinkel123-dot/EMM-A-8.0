@@ -127,6 +127,7 @@ public Program ()
     else if (tickSpeed == UpdateFrequency.Update100)
         echoFrequency = 1;
 
+    LoadState();
     Echo("Ready.");
     Runtime.UpdateFrequency = tickSpeed;
 }
@@ -142,7 +143,10 @@ public void Main (string argument, UpdateType updateSource)
     if (updateSource == UpdateType.Update100 || updateSource == UpdateType.Update10 || updateSource == UpdateType.Update1)
     {
         if (runtime % echoFrequency == 0)
+        {
             WriteEcho();
+            SaveState();
+        }
 
         if (miningEnabled)
             UpdateMiningState();
@@ -1134,6 +1138,143 @@ void DumpCurrentGpsToCustomData()
 
     Me.CustomData = sb.ToString();
     Echo("Dumped GPS/orientation to Custom Data.");
+}
+
+// ---- State persistence (Me.Storage) ----
+
+string V3ToString(Vector3D v)
+{
+    return v.X.ToString("R") + ":" + v.Y.ToString("R") + ":" + v.Z.ToString("R");
+}
+
+bool TryParseV3(string s, out Vector3D v)
+{
+    v = Vector3D.Zero;
+    if (string.IsNullOrWhiteSpace(s)) return false;
+    string[] p = s.Split(':');
+    if (p.Length != 3) return false;
+    double x, y, z;
+    if (!double.TryParse(p[0], out x) || !double.TryParse(p[1], out y) || !double.TryParse(p[2], out z)) return false;
+    v = new Vector3D(x, y, z);
+    return true;
+}
+
+void SaveState()
+{
+    var sb = new StringBuilder();
+    sb.AppendLine("autopilotEnabled=" + (autopilotEnabled ? "1" : "0"));
+    sb.AppendLine("hasTarget=" + (hasTarget ? "1" : "0"));
+    sb.AppendLine("targetPosition=" + V3ToString(targetPosition));
+    sb.AppendLine("desiredForward=" + V3ToString(desiredForward));
+    sb.AppendLine("desiredUp=" + V3ToString(desiredUp));
+    sb.AppendLine("miningEnabled=" + (miningEnabled ? "1" : "0"));
+    sb.AppendLine("miningState=" + (int)miningState);
+    sb.AppendLine("laneAnchor=" + V3ToString(laneAnchor));
+    sb.AppendLine("drillAxis=" + V3ToString(drillAxis));
+    sb.AppendLine("laneDepth=" + laneDepth.ToString("R"));
+    sb.AppendLine("speedF=" + SPEEDF.ToString("R"));
+    sb.AppendLine("speedB=" + SPEEDB.ToString("R"));
+    sb.AppendLine("activeMaxSpeed=" + activeMaxSpeed.ToString("R"));
+    sb.AppendLine("mineH=" + MINEH.ToString("R"));
+    sb.AppendLine("mineW=" + MINEW.ToString("R"));
+    sb.AppendLine("depthMode=" + (int)depthMode);
+    sb.AppendLine("areaMiningMode=" + (areaMiningMode ? "1" : "0"));
+    sb.AppendLine("areaLaneIndex=" + areaLaneIndex);
+    sb.AppendLine("retryLane=" + (retryCurrentLane ? "1" : "0"));
+    sb.AppendLine("areaLaneCount=" + areaLaneAnchors.Count);
+    for (int i = 0; i < areaLaneAnchors.Count; i++)
+        sb.AppendLine("areaLane" + i + "=" + V3ToString(areaLaneAnchors[i]));
+    sb.AppendLine("pathMode=" + (pathMode ? "1" : "0"));
+    sb.AppendLine("pathPaused=" + (pathPaused ? "1" : "0"));
+    sb.AppendLine("pathPausedNavResume=" + (pathPausedNavResume ? "1" : "0"));
+    sb.AppendLine("pathIndex=" + pathIndex);
+    sb.AppendLine("pathCount=" + pathRecords.Count);
+    for (int i = 0; i < pathRecords.Count; i++)
+        sb.AppendLine("pathRecord" + i + "=" + pathRecords[i]);
+    sb.AppendLine("TOFFR=" + TOFFR.ToString("R"));
+    sb.AppendLine("TOFFU=" + TOFFU.ToString("R"));
+    sb.AppendLine("TOFFF=" + TOFFF.ToString("R"));
+    Me.Storage = sb.ToString();
+}
+
+void LoadState()
+{
+    string data = Me.Storage;
+    if (string.IsNullOrWhiteSpace(data))
+        return;
+
+    var dict = new Dictionary<string, string>();
+    foreach (string line in data.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
+    {
+        int eq = line.IndexOf('=');
+        if (eq < 0) continue;
+        dict[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+    }
+
+    string s;
+    int n;
+    double d;
+    Vector3D v;
+
+    if (dict.TryGetValue("autopilotEnabled", out s)) autopilotEnabled = s == "1";
+    if (dict.TryGetValue("hasTarget", out s)) hasTarget = s == "1";
+    if (dict.TryGetValue("targetPosition", out s) && TryParseV3(s, out v)) targetPosition = v;
+    if (dict.TryGetValue("desiredForward", out s) && TryParseV3(s, out v)) desiredForward = v;
+    if (dict.TryGetValue("desiredUp", out s) && TryParseV3(s, out v)) desiredUp = v;
+    if (dict.TryGetValue("miningEnabled", out s)) miningEnabled = s == "1";
+    if (dict.TryGetValue("miningState", out s) && int.TryParse(s, out n)) miningState = (MiningState)n;
+    if (dict.TryGetValue("laneAnchor", out s) && TryParseV3(s, out v)) laneAnchor = v;
+    if (dict.TryGetValue("drillAxis", out s) && TryParseV3(s, out v)) drillAxis = v;
+    if (dict.TryGetValue("laneDepth", out s) && double.TryParse(s, out d)) laneDepth = d;
+    if (dict.TryGetValue("speedF", out s) && double.TryParse(s, out d)) SPEEDF = d;
+    if (dict.TryGetValue("speedB", out s) && double.TryParse(s, out d)) SPEEDB = d;
+    if (dict.TryGetValue("activeMaxSpeed", out s) && double.TryParse(s, out d)) activeMaxSpeed = d;
+    if (dict.TryGetValue("mineH", out s) && double.TryParse(s, out d)) MINEH = d;
+    if (dict.TryGetValue("mineW", out s) && double.TryParse(s, out d)) MINEW = d;
+    if (dict.TryGetValue("depthMode", out s) && int.TryParse(s, out n)) depthMode = (DepthMode)n;
+    if (dict.TryGetValue("areaMiningMode", out s)) areaMiningMode = s == "1";
+    if (dict.TryGetValue("areaLaneIndex", out s) && int.TryParse(s, out n)) areaLaneIndex = n;
+    if (dict.TryGetValue("retryLane", out s)) retryCurrentLane = s == "1";
+
+    int laneCount = 0;
+    if (dict.TryGetValue("areaLaneCount", out s) && int.TryParse(s, out laneCount) && laneCount > 0)
+    {
+        areaLaneAnchors = new List<Vector3D>(laneCount);
+        for (int i = 0; i < laneCount; i++)
+        {
+            if (dict.TryGetValue("areaLane" + i, out s) && TryParseV3(s, out v))
+                areaLaneAnchors.Add(v);
+        }
+    }
+
+    if (dict.TryGetValue("pathMode", out s)) pathMode = s == "1";
+    if (dict.TryGetValue("pathPaused", out s)) pathPaused = s == "1";
+    if (dict.TryGetValue("pathPausedNavResume", out s)) pathPausedNavResume = s == "1";
+    if (dict.TryGetValue("pathIndex", out s) && int.TryParse(s, out n)) pathIndex = n;
+
+    int pathCount = 0;
+    if (dict.TryGetValue("pathCount", out s) && int.TryParse(s, out pathCount) && pathCount > 0)
+    {
+        pathRecords = new List<string>(pathCount);
+        for (int i = 0; i < pathCount; i++)
+        {
+            if (dict.TryGetValue("pathRecord" + i, out s))
+                pathRecords.Add(s);
+        }
+    }
+
+    if (dict.TryGetValue("TOFFR", out s) && double.TryParse(s, out d)) TOFFR = d;
+    if (dict.TryGetValue("TOFFU", out s) && double.TryParse(s, out d)) TOFFU = d;
+    if (dict.TryGetValue("TOFFF", out s) && double.TryParse(s, out d)) TOFFF = d;
+
+    // If drills were actively running when the reload happened, turn them back on
+    // and reset the stuck monitor so the stuck timer starts fresh.
+    if (miningEnabled && miningState == MiningState.DrillForward)
+    {
+        SetDrills(true);
+        ResetStuckMonitor();
+        ResetDepthAutoTracker();
+    }
 }
 
 bool TryParseGpsCommand(string command, out Vector3D gps, out Vector3D forward, out Vector3D up)
