@@ -97,6 +97,7 @@ int pathIndex = 0;
 Vector3D stuckSamplePos = Vector3D.Zero;
 double stuckNoMoveSeconds = 0;
 int stuckRetryCount = 0;
+bool stuckBackout = false;
 const double stuckTimeoutSeconds = 5.0;
 const double stuckMoveThreshold = 0.25;
 double secondsPerTick = 1.0 / 60.0;
@@ -913,6 +914,7 @@ void UpdateMiningState()
             if (CheckStuckInLane())
             {
                 retryCurrentLane = true;
+                stuckBackout = true;
                 miningState = MiningState.Backout;
                 Echo("Stuck detected. Returning to anchor and retrying lane.");
             }
@@ -936,8 +938,10 @@ void UpdateMiningState()
                 if (retryCurrentLane)
                 {
                     retryCurrentLane = false;
-                    stuckRetryCount++;
-                    bool giveUp = maxStuckRetries > 0 && stuckRetryCount >= maxStuckRetries;
+                    bool wasStuck = stuckBackout;
+                    stuckBackout = false;
+                    if (wasStuck) stuckRetryCount++;
+                    bool giveUp = wasStuck && maxStuckRetries > 0 && stuckRetryCount >= maxStuckRetries;
                     if (giveUp && areaMiningMode && areaLaneIndex + 1 < areaLaneAnchors.Count)
                     {
                         Echo($"Max retries ({maxStuckRetries}) reached. Skipping lane {areaLaneIndex + 1}.");
@@ -961,7 +965,10 @@ void UpdateMiningState()
                     else
                     {
                         miningState = MiningState.EnterLane;
-                        Echo($"Retrying lane {areaLaneIndex + 1}/{Math.Max(1, areaLaneAnchors.Count)} (attempt {stuckRetryCount + 1}/{maxStuckRetries})");
+                        string retryInfo = maxStuckRetries > 0
+                            ? $"attempt {stuckRetryCount + 1}/{maxStuckRetries}"
+                            : "no limit";
+                        Echo($"Retrying lane {areaLaneIndex + 1}/{Math.Max(1, areaLaneAnchors.Count)} ({retryInfo})");
                     }
                 }
                 else if (areaMiningMode && areaLaneIndex + 1 < areaLaneAnchors.Count)
@@ -1209,6 +1216,7 @@ void SaveState()
     sb.AppendLine("areaMiningMode=" + (areaMiningMode ? "1" : "0"));
     sb.AppendLine("areaLaneIndex=" + areaLaneIndex);
     sb.AppendLine("retryLane=" + (retryCurrentLane ? "1" : "0"));
+    sb.AppendLine("stuckBackout=" + (stuckBackout ? "1" : "0"));
     sb.AppendLine("stuckRetryCount=" + stuckRetryCount);
     sb.AppendLine("areaLaneCount=" + areaLaneAnchors.Count);
     for (int i = 0; i < areaLaneAnchors.Count; i++)
@@ -1257,6 +1265,7 @@ void LoadState()
     if (dict.TryGetValue("areaMiningMode", out s)) areaMiningMode = s == "1";
     if (dict.TryGetValue("areaLaneIndex", out s) && int.TryParse(s, out n)) areaLaneIndex = n;
     if (dict.TryGetValue("retryLane", out s)) retryCurrentLane = s == "1";
+    if (dict.TryGetValue("stuckBackout", out s)) stuckBackout = s == "1";
     if (dict.TryGetValue("stuckRetryCount", out s) && int.TryParse(s, out n)) stuckRetryCount = n;
 
     int laneCount = 0;
