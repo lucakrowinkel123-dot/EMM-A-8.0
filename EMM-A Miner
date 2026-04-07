@@ -20,6 +20,7 @@
 // pathpause : pauses queue and active movement; minearea returns to current anchor and waits
 // pathcontinue : resumes queue advancement after pathpause
 // pathstop : stops path mode and clears remaining queued records
+// stoneejector on|off : manually enable or disable stone ejector sorters
 // SPEEDF <value> : sets forward drilling speed (m/s)
 // SPEEDB <value> : sets backing-out speed (m/s)
 // MINEH <value> : sets miner lane height footprint (m)
@@ -41,6 +42,7 @@ double TOFFR = 0; // target offset Right (m)
 double TOFFU = -2.5; // target offset Up (m)
 double TOFFF = 0; // target offset Forward (m)
 string pathTimerTag = "Path";
+string stoneEjectorTag = "StoneEjector"; // name tag for conveyor sorter blocks that route stone to ejectors
 // =============================================
 
 IMyShipController rc;
@@ -98,6 +100,8 @@ double stuckNoMoveSeconds = 0;
 const double stuckTimeoutSeconds = 5.0;
 const double stuckMoveThreshold = 0.25;
 double secondsPerTick = 1.0 / 60.0;
+List<IMyConveyorSorter> stoneEjectors = new List<IMyConveyorSorter>();
+string lastMineCommand = ""; // persisted to Storage for resume on restart
 
 readonly int echoFrequency = 100; // every 100th game tick
 int runtime = 0;
@@ -116,6 +120,15 @@ public Program ()
     thrust = new ThrusterControl(rc, tickSpeed, GetBlocks<IMyThrust>());
     gyros = new GyroControl(rc, tickSpeed, GetBlocks<IMyGyro>());
     drills = GetBlocks<IMyShipDrill>();
+
+    List<IMyConveyorSorter> allSorters = GetBlocks<IMyConveyorSorter>();
+    foreach (var s in allSorters)
+    {
+        if (s.CustomName.IndexOf(stoneEjectorTag, StringComparison.OrdinalIgnoreCase) >= 0)
+            stoneEjectors.Add(s);
+    }
+
+    LoadState();
 
     if (tickSpeed == UpdateFrequency.Update10)
         secondsPerTick = 10.0 / 60.0;
@@ -158,6 +171,7 @@ public void Main (string argument, UpdateType updateSource)
     else
     {
         RemoteCommand(argument);
+        SaveState();
     }
 }
 
@@ -387,6 +401,7 @@ void RemoteCommand (string command)
             pathRecords.Clear();
             pathIndex = 0;
             activeMaxSpeed = 0;
+            lastMineCommand = "";
             SetDrills(false);
             ResetMovement();
             WriteEcho();
@@ -402,6 +417,7 @@ void RemoteCommand (string command)
             areaLaneIndex = 0;
             retryCurrentLane = false;
             activeMaxSpeed = 0;
+            lastMineCommand = "";
             SetDrills(false);
             Echo("Mining cancelled.");
             break;
@@ -468,6 +484,16 @@ void RemoteCommand (string command)
             TOFFU = 0;
             TOFFF = 0;
             Echo("TOFF reset to 0,0,0.");
+            break;
+        case "stoneejector on":
+            foreach (var s in stoneEjectors)
+                if (s != null && s.IsFunctional) s.Enabled = true;
+            Echo($"Stone ejectors on ({stoneEjectors.Count} block(s)).");
+            break;
+        case "stoneejector off":
+            foreach (var s in stoneEjectors)
+                if (s != null && s.IsFunctional) s.Enabled = false;
+            Echo($"Stone ejectors off ({stoneEjectors.Count} block(s)).");
             break;
         default:
             if (trimmed.StartsWith("minelane;", StringComparison.OrdinalIgnoreCase))
@@ -553,6 +579,12 @@ bool ExecutePathRecord(string rawRecord)
     if (record.StartsWith("minearea;", StringComparison.OrdinalIgnoreCase))
     {
         StartAreaMining(record);
+        return miningEnabled;
+    }
+
+    if (record.StartsWith("minelane;", StringComparison.OrdinalIgnoreCase))
+    {
+        StartSingleLaneMining(record);
         return miningEnabled;
     }
 
@@ -677,6 +709,7 @@ void StartSingleLaneMining(string command)
     autopilotEnabled = true;
     miningEnabled = true;
     miningState = MiningState.EnterLane;
+    lastMineCommand = command;
     ResetDepthAutoTracker();
     Echo($"Mining lane started. Depth={laneDepth:0.00}m");
 }
@@ -741,6 +774,7 @@ void StartAreaMining(string command)
     autopilotEnabled = true;
     miningEnabled = true;
     miningState = MiningState.EnterLane;
+    lastMineCommand = command;
     ResetDepthAutoTracker();
 
     Echo($"Area mining started. Lanes={areaLaneAnchors.Count}, depth={laneDepth:0.00}m");
@@ -936,6 +970,7 @@ void UpdateMiningState()
                     laneAnchor = areaLaneAnchors[areaLaneIndex];
                     ResetDepthAutoTracker();
                     miningState = MiningState.EnterLane;
+                    SaveState();
                     Echo($"Proceeding to lane {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
                 }
                 else
@@ -947,6 +982,8 @@ void UpdateMiningState()
                     areaMiningMode = false;
                     areaLaneAnchors.Clear();
                     areaLaneIndex = 0;
+                    lastMineCommand = "";
+                    SaveState();
                     Echo("Mining operation complete.");
                 }
             }
@@ -1114,6 +1151,12 @@ void SetDrills(bool enabled)
             continue;
         d.Enabled = enabled;
     }
+    foreach (var s in stoneEjectors)
+    {
+        if (s == null || !s.IsFunctional)
+            continue;
+        s.Enabled = enabled;
+    }
 }
 
 void DumpCurrentGpsToCustomData()
@@ -1134,6 +1177,118 @@ void DumpCurrentGpsToCustomData()
 
     Me.CustomData = sb.ToString();
     Echo("Dumped GPS/orientation to Custom Data.");
+}
+
+void SaveState()
+{
+    var sb = new StringBuilder();
+    sb.AppendLine($"SPEEDF={SPEEDF:R}");
+    sb.AppendLine($"SPEEDB={SPEEDB:R}");
+    sb.AppendLine($"MINEH={MINEH:R}");
+    sb.AppendLine($"MINEW={MINEW:R}");
+    sb.AppendLine($"DEPTHMODE={depthMode}");
+    sb.AppendLine($"TOFFR={TOFFR:R}");
+    sb.AppendLine($"TOFFU={TOFFU:R}");
+    sb.AppendLine($"TOFFF={TOFFF:R}");
+    if (miningEnabled && !string.IsNullOrWhiteSpace(lastMineCommand))
+    {
+        sb.AppendLine($"MINECOMMAND={lastMineCommand}");
+        if (areaMiningMode)
+            sb.AppendLine($"LANEIDX={areaLaneIndex}");
+        sb.AppendLine($"LANEDEPTH={laneDepth:R}");
+        sb.AppendLine($"LANEANCHOR={laneAnchor.X:R},{laneAnchor.Y:R},{laneAnchor.Z:R}");
+        sb.AppendLine($"DRILLAXIS={drillAxis.X:R},{drillAxis.Y:R},{drillAxis.Z:R}");
+        sb.AppendLine($"DESIREDUP={desiredUp.X:R},{desiredUp.Y:R},{desiredUp.Z:R}");
+    }
+    Storage = sb.ToString();
+}
+
+void LoadState()
+{
+    string raw = Storage;
+    if (string.IsNullOrWhiteSpace(raw))
+        return;
+
+    string mineCommand = "";
+    int laneIdx = 0;
+    double laneDep = 0;
+    Vector3D anchor = Vector3D.Zero;
+    Vector3D axis = Vector3D.Zero;
+    Vector3D upVec = Vector3D.Zero;
+
+    string[] lines = raw.Split('\n');
+    foreach (string line in lines)
+    {
+        string l = line.Trim();
+        int eq = l.IndexOf('=');
+        if (eq < 0)
+            continue;
+        string key = l.Substring(0, eq).Trim().ToUpperInvariant();
+        string val = l.Substring(eq + 1).Trim();
+        double d;
+        switch (key)
+        {
+            case "SPEEDF":    if (double.TryParse(val, out d) && d > 0) SPEEDF = d; break;
+            case "SPEEDB":    if (double.TryParse(val, out d) && d > 0) SPEEDB = d; break;
+            case "MINEH":     if (double.TryParse(val, out d) && d > 0) MINEH = d; break;
+            case "MINEW":     if (double.TryParse(val, out d) && d > 0) MINEW = d; break;
+            case "DEPTHMODE":
+                if (val == "Ore") depthMode = DepthMode.Ore;
+                else if (val == "OrePlusStone") depthMode = DepthMode.OrePlusStone;
+                else depthMode = DepthMode.Default;
+                break;
+            case "TOFFR":     if (double.TryParse(val, out d)) TOFFR = d; break;
+            case "TOFFU":     if (double.TryParse(val, out d)) TOFFU = d; break;
+            case "TOFFF":     if (double.TryParse(val, out d)) TOFFF = d; break;
+            case "MINECOMMAND": mineCommand = val; break;
+            case "LANEIDX":   int.TryParse(val, out laneIdx); break;
+            case "LANEDEPTH": double.TryParse(val, out laneDep); break;
+            case "LANEANCHOR": TryParseVector3(val, out anchor); break;
+            case "DRILLAXIS": TryParseVector3(val, out axis); break;
+            case "DESIREDUP": TryParseVector3(val, out upVec); break;
+        }
+    }
+
+    if (string.IsNullOrWhiteSpace(mineCommand))
+        return;
+
+    if (mineCommand.StartsWith("minearea;", StringComparison.OrdinalIgnoreCase))
+    {
+        StartAreaMining(mineCommand);
+        if (laneIdx > 0 && laneIdx < areaLaneAnchors.Count)
+        {
+            areaLaneIndex = laneIdx;
+            laneAnchor = areaLaneAnchors[areaLaneIndex];
+            targetPosition = laneAnchor;
+            ResetDepthAutoTracker();
+            Echo($"Resumed area mining at lane {areaLaneIndex + 1}/{areaLaneAnchors.Count}.");
+        }
+    }
+    else if (mineCommand.StartsWith("minelane;", StringComparison.OrdinalIgnoreCase))
+    {
+        // Re-run would use current ship position as anchor, so restore geometry directly.
+        if (axis.LengthSquared() > 0.001 && laneDep > 0)
+        {
+            laneDepth = laneDep;
+            laneAnchor = anchor;
+            drillAxis = Vector3D.Normalize(axis);
+            desiredUp = upVec.LengthSquared() > 0.001 ? Vector3D.Normalize(upVec) : Vector3D.Zero;
+            desiredForward = drillAxis;
+            areaMiningMode = false;
+            areaLaneAnchors.Clear();
+            areaLaneIndex = 0;
+            retryCurrentLane = false;
+            targetPosition = laneAnchor;
+            activeMaxSpeed = SPEEDB;
+            hasTarget = true;
+            autopilotEnabled = true;
+            miningEnabled = true;
+            miningState = MiningState.EnterLane;
+            lastMineCommand = mineCommand;
+            ResetDepthAutoTracker();
+            Echo("Resumed single lane mining.");
+        }
+    }
 }
 
 bool TryParseGpsCommand(string command, out Vector3D gps, out Vector3D forward, out Vector3D up)
@@ -1456,7 +1611,7 @@ class GyroControl
             /// Projects a value onto another vector.
             /// </summary>
             /// <param name="guide">Must be of length 1.</param>
-    public static Vector3D VectorPojection (Vector3D value, Vector3D guide)
+    public static Vector3D VectorProjection (Vector3D value, Vector3D guide)
     {
         return ScalerProjection(value, guide) * guide;
     }
@@ -1467,7 +1622,7 @@ class GyroControl
             /// <param name="guide">Must be of length 1.</param>
     public static Vector3D VectorRejection (Vector3D value, Vector3D guide)
     {
-        return value - VectorPojection(value, guide);
+        return value - VectorProjection(value, guide);
     }
 }
 
