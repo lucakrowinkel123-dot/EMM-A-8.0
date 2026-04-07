@@ -387,6 +387,7 @@ void RemoteCommand (string command)
             areaLaneAnchors.Clear();
             areaLaneIndex = 0;
             retryCurrentLane = false;
+            stuckRetryCount = 0;
             pathMode = false;
             pathPaused = false;
             pathPausedNavResume = false;
@@ -1115,6 +1116,7 @@ void NextHole()
     }
 
     SetDrills(false);
+    stuckRetryCount = 0;
     areaLaneIndex++;
     areaMiningMode = true;
     laneAnchor = areaLaneAnchors[areaLaneIndex];
@@ -1202,11 +1204,7 @@ void SaveState()
     sb.AppendLine("laneAnchor=" + V3ToString(laneAnchor));
     sb.AppendLine("drillAxis=" + V3ToString(drillAxis));
     sb.AppendLine("laneDepth=" + laneDepth.ToString("R"));
-    sb.AppendLine("speedF=" + SPEEDF.ToString("R"));
-    sb.AppendLine("speedB=" + SPEEDB.ToString("R"));
     sb.AppendLine("activeMaxSpeed=" + activeMaxSpeed.ToString("R"));
-    sb.AppendLine("mineH=" + MINEH.ToString("R"));
-    sb.AppendLine("mineW=" + MINEW.ToString("R"));
     sb.AppendLine("depthMode=" + (int)depthMode);
     sb.AppendLine("areaMiningMode=" + (areaMiningMode ? "1" : "0"));
     sb.AppendLine("areaLaneIndex=" + areaLaneIndex);
@@ -1222,9 +1220,6 @@ void SaveState()
     sb.AppendLine("pathCount=" + pathRecords.Count);
     for (int i = 0; i < pathRecords.Count; i++)
         sb.AppendLine("pathRecord" + i + "=" + pathRecords[i]);
-    sb.AppendLine("TOFFR=" + TOFFR.ToString("R"));
-    sb.AppendLine("TOFFU=" + TOFFU.ToString("R"));
-    sb.AppendLine("TOFFF=" + TOFFF.ToString("R"));
     Storage = sb.ToString();
 }
 
@@ -1257,11 +1252,7 @@ void LoadState()
     if (dict.TryGetValue("laneAnchor", out s) && TryParseV3(s, out v)) laneAnchor = v;
     if (dict.TryGetValue("drillAxis", out s) && TryParseV3(s, out v)) drillAxis = v;
     if (dict.TryGetValue("laneDepth", out s) && double.TryParse(s, out d)) laneDepth = d;
-    if (dict.TryGetValue("speedF", out s) && double.TryParse(s, out d)) SPEEDF = d;
-    if (dict.TryGetValue("speedB", out s) && double.TryParse(s, out d)) SPEEDB = d;
     if (dict.TryGetValue("activeMaxSpeed", out s) && double.TryParse(s, out d)) activeMaxSpeed = d;
-    if (dict.TryGetValue("mineH", out s) && double.TryParse(s, out d)) MINEH = d;
-    if (dict.TryGetValue("mineW", out s) && double.TryParse(s, out d)) MINEW = d;
     if (dict.TryGetValue("depthMode", out s) && int.TryParse(s, out n)) depthMode = (DepthMode)n;
     if (dict.TryGetValue("areaMiningMode", out s)) areaMiningMode = s == "1";
     if (dict.TryGetValue("areaLaneIndex", out s) && int.TryParse(s, out n)) areaLaneIndex = n;
@@ -1294,10 +1285,6 @@ void LoadState()
                 pathRecords.Add(s);
         }
     }
-
-    if (dict.TryGetValue("TOFFR", out s) && double.TryParse(s, out d)) TOFFR = d;
-    if (dict.TryGetValue("TOFFU", out s) && double.TryParse(s, out d)) TOFFU = d;
-    if (dict.TryGetValue("TOFFF", out s) && double.TryParse(s, out d)) TOFFF = d;
 
     // If drills were actively running when the reload happened, turn them back on
     // and reset the stuck monitor so the stuck timer starts fresh.
