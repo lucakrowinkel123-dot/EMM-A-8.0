@@ -219,10 +219,7 @@ void Move ()
     bool aligned = IsOrientationAligned(forward, up, orientationToleranceDeg);
     if (atPosition)
     {
-        // Actively damp residual velocity instead of cutting thrust cold.
-        // Cutting cold causes oscillation: ship drifts out of tolerance, thrust
-        // kicks back in, ship arrives, cuts again, repeat.
-        thrust.ApplyAccel(thrust.ControlVelocity(Vector3D.Zero));
+        thrust.Reset();
         if (aligned)
             gyros.Reset();
         return;
