@@ -911,16 +911,12 @@ void UpdateMiningState()
             activeMaxSpeed = SPEEDF;
             if (CheckStuckInLane())
             {
-                SetDrills(false);
                 retryCurrentLane = true;
                 miningState = MiningState.Backout;
                 Echo("Stuck detected. Returning to anchor and retrying lane.");
             }
             else if (ShouldFinishDrillForward())
-            {
-                SetDrills(false);
                 miningState = MiningState.Backout;
-            }
             break;
         case MiningState.Backout:
             targetPosition = laneAnchor;
@@ -928,6 +924,8 @@ void UpdateMiningState()
             activeMaxSpeed = SPEEDB;
             if (IsAtTargetPosition(targetPosition))
             {
+                if (!retryCurrentLane)
+                    SetDrills(false);
                 if (pathMode && pathPaused)
                 {
                     autopilotEnabled = false;
