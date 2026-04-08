@@ -126,6 +126,13 @@ double secondsPerTick = 1.0 / 60.0;
 readonly int echoFrequency = 100; // every 100th game tick
 int runtime = 0;
 
+// Cached block/item lists reused by GetOreAmount to avoid per-call GTS scans and allocations
+List<IMyTerminalBlock> _invBlocks = new List<IMyTerminalBlock>();
+List<MyInventoryItem> _invItems = new List<MyInventoryItem>();
+bool _invCached = false;
+// Cached path timer reference to avoid repeated GTS scans during path recording
+IMyTimerBlock _cachedPathTimer;
+
 public Program ()
 {
     // Prioritize the given cockpit name
@@ -705,10 +712,17 @@ bool AppendPathRecordLine(string line)
 
 IMyTimerBlock FindPathTimer()
 {
+    if (_cachedPathTimer != null &&
+        _cachedPathTimer.CustomName.IndexOf(pathTimerTag, StringComparison.OrdinalIgnoreCase) >= 0)
+        return _cachedPathTimer;
     foreach (var t in GetBlocks<IMyTimerBlock>())
         if (t != null && !string.IsNullOrWhiteSpace(t.CustomName) &&
             t.CustomName.IndexOf(pathTimerTag, StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            _cachedPathTimer = t;
             return t;
+        }
+    _cachedPathTimer = null;
     return null;
 }
 
@@ -938,6 +952,7 @@ void StartSingleLaneMining(string command)
     autopilotEnabled = true;
     miningEnabled = true;
     miningState = MiningState.EnterLane;
+    _invCached = false; // refresh inventory block list for ore tracking
     ResetDepthAutoTracker();
     Echo($"Mining lane started. Depth={laneDepth:0.00}m");
 }
@@ -1003,6 +1018,7 @@ void StartAreaMining(string command)
     autopilotEnabled = true;
     miningEnabled = true;
     miningState = MiningState.EnterLane;
+    _invCached = false; // refresh inventory block list for ore tracking
     ResetDepthAutoTracker();
 
     Echo($"Area mining started. Lanes={areaLaneAnchors.Count}, depth={laneDepth:0.00}m");
@@ -1300,24 +1316,32 @@ bool ShouldFinishDrillForward()
     return depthProgress >= laneDepth && noOreGainTicks >= noOreGainTickLimit;
 }
 
+void RefreshInventoryCache()
+{
+    _invBlocks.Clear();
+    GridTerminalSystem.GetBlocksOfType(_invBlocks, b => b.CubeGrid.EntityId == Me.CubeGrid.EntityId && b.HasInventory);
+    _invCached = true;
+}
+
 double GetOreAmount(bool includeStone)
 {
-    List<IMyTerminalBlock> blocks = new List<IMyTerminalBlock>();
-    GridTerminalSystem.GetBlocksOfType(blocks, b => b.CubeGrid.EntityId == Me.CubeGrid.EntityId && b.HasInventory);
+    if (!_invCached)
+        RefreshInventoryCache();
 
     double total = 0;
-    List<MyInventoryItem> items = new List<MyInventoryItem>();
-    foreach (var block in blocks)
+    foreach (var block in _invBlocks)
     {
+        if (block == null || !block.IsFunctional)
+            continue;
         int invCount = block.InventoryCount;
         for (int i = 0; i < invCount; i++)
         {
             var inv = block.GetInventory(i);
             if (inv == null)
                 continue;
-            items.Clear();
-            inv.GetItems(items);
-            foreach (var item in items)
+            _invItems.Clear();
+            inv.GetItems(_invItems);
+            foreach (var item in _invItems)
             {
                 if (!string.Equals(item.Type.TypeId, "MyObjectBuilder_Ore", StringComparison.OrdinalIgnoreCase))
                     continue;
