@@ -1,0 +1,662 @@
+
+// EMM-A Path Recorder
+
+// ============= Commands ==============
+// pathrecordstart          : begin recording; saves GPS+orientation every X meters
+// pathrecordstop           : stop recording
+// pathrecordclear          : wipe the path timer's custom data and reset index
+// pathrecordmine           : run 3 times to define a mining area:
+//   1st run  : saves anchor waypoint, locks orientation, pauses auto-recording
+//   2nd run  : marks top-left corner (Corner A), soft-locks movement to right+down plane
+//   3rd run  : marks bottom-right corner (Corner B), writes minearea record, returns to anchor
+// DEPTH <value>            : set mining depth used in minearea records
+// =====================================
+
+// ========== Settings ==========
+string cockpitName       = "Cockpit";
+string recordTimerTag    = "Path";
+double recordStepMeters  = 5.0;   // auto-waypoint every N meters
+double recordMineDepth   = 30.0;  // depth written into minearea records
+UpdateFrequency tickSpeed = UpdateFrequency.Update1;
+double arrivalTolerance       = 0.25;
+double orientationToleranceDeg = 1.0;
+// ==============================
+
+IMyShipController rc;
+ThrusterControl   thrust;
+GyroControl       gyros;
+
+// recording state
+bool     recording     = false;
+Vector3D lastRecordPos = Vector3D.Zero;
+int      recordIndex   = 0; // next waypoint number (0-based → displayed as 001, 002, …)
+
+// pathrecordmine state machine  0=idle  1=anchor saved  2=cornerA set  3=returning
+int      mineState         = 0;
+Vector3D mineAnchorPos     = Vector3D.Zero;
+Vector3D mineAnchorForward = Vector3D.Zero;
+Vector3D mineAnchorUp      = Vector3D.Zero;
+Vector3D mineCornerA       = Vector3D.Zero;
+
+// orientation lock (active during mineState 1, 2, 3)
+bool     orientationLocked = false;
+Vector3D lockedForward     = Vector3D.Zero;
+Vector3D lockedUp          = Vector3D.Zero;
+
+// soft movement lock axes (active during mineState 2)
+bool     softLockEnabled = false;
+Vector3D slOrigin        = Vector3D.Zero; // cornerA world position
+Vector3D slFwd           = Vector3D.Zero; // drill axis – movement blocked
+Vector3D slRight         = Vector3D.Zero; // allowed direction
+Vector3D slUp            = Vector3D.Zero; // negative = allowed (down)
+
+// return-to-anchor autopilot (active during mineState 3)
+bool returning = false;
+
+double secondsPerTick  = 1.0 / 60.0;
+int    runtime         = 0;
+readonly int echoFreq  = 100;
+
+public Program()
+{
+    rc = GetBlock<IMyShipController>(cockpitName, true);
+    if (rc == null) rc = GetBlock<IMyCockpit>();
+    if (rc == null) rc = GetBlock<IMyRemoteControl>();
+    if (rc == null)
+        throw new Exception("No cockpit/remote control found. Set cockpitName at the top.");
+
+    thrust = new ThrusterControl(rc, tickSpeed, GetBlocks<IMyThrust>());
+    gyros  = new GyroControl(rc, tickSpeed, GetBlocks<IMyGyro>());
+
+    if (tickSpeed == UpdateFrequency.Update10)  secondsPerTick = 10.0 / 60.0;
+    if (tickSpeed == UpdateFrequency.Update100) secondsPerTick = 100.0 / 60.0;
+    if (tickSpeed == UpdateFrequency.Update10)  echoFreq = 10;
+    if (tickSpeed == UpdateFrequency.Update100) echoFreq = 1;
+
+    Runtime.UpdateFrequency = tickSpeed;
+    Echo("Path Recorder ready.");
+}
+
+public void Main(string argument, UpdateType updateSource)
+{
+    bool isTick = updateSource == UpdateType.Update1
+               || updateSource == UpdateType.Update10
+               || updateSource == UpdateType.Update100;
+
+    if (isTick)
+    {
+        if (orientationLocked)
+            gyros.FaceVectors(lockedForward, lockedUp);
+        else
+            gyros.Reset();
+
+        if (softLockEnabled)
+            ApplySoftLock();
+        else if (returning)
+            ApplyReturn();
+        else
+            thrust.Reset();
+
+        if (recording)
+            CheckAutoRecord();
+
+        if (runtime % echoFreq == 0)
+            WriteEcho();
+
+        runtime++;
+    }
+    else
+    {
+        HandleCommand(argument);
+    }
+}
+
+void WriteEcho()
+{
+    var sb = new StringBuilder();
+    sb.AppendLine("=== Path Recorder ===");
+    sb.AppendLine(recording ? "Recording: ON" : "Recording: OFF");
+    sb.AppendLine($"Step: {recordStepMeters:0.0} m    Depth: {recordMineDepth:0.0} m");
+    sb.AppendLine($"Next waypoint: {(recordIndex + 1):D3}");
+    if (mineState == 1)
+        sb.AppendLine("Mine: fly to TOP-LEFT corner, run pathrecordmine");
+    else if (mineState == 2)
+        sb.AppendLine("Mine: fly to BOTTOM-RIGHT corner, run pathrecordmine");
+    else if (mineState == 3)
+        sb.AppendLine("Mine: returning to anchor...");
+    if (orientationLocked)
+        sb.AppendLine("[orientation locked]");
+    if (softLockEnabled)
+        sb.AppendLine("[movement: right+down only]");
+    Echo(sb.ToString());
+}
+
+// ---- Command handling ----
+
+void HandleCommand(string argument)
+{
+    string cmd = argument.Trim();
+
+    if (string.Equals(cmd, "pathrecordstart", StringComparison.OrdinalIgnoreCase))
+    {
+        recordIndex   = CountExistingRecords();
+        recording     = true;
+        lastRecordPos = rc.GetPosition();
+        Echo($"Recording started. Next: {(recordIndex + 1):D3}");
+        return;
+    }
+
+    if (string.Equals(cmd, "pathrecordstop", StringComparison.OrdinalIgnoreCase))
+    {
+        recording          = false;
+        orientationLocked  = false;
+        softLockEnabled    = false;
+        returning          = false;
+        mineState          = 0;
+        gyros.Reset();
+        thrust.Reset();
+        Echo("Recording stopped.");
+        return;
+    }
+
+    if (string.Equals(cmd, "pathrecordclear", StringComparison.OrdinalIgnoreCase))
+    {
+        var timer = FindTimer();
+        if (timer != null) { timer.CustomData = ""; recordIndex = 0; Echo("Timer cleared."); }
+        else Echo($"No timer with tag '{recordTimerTag}' found.");
+        return;
+    }
+
+    if (string.Equals(cmd, "pathrecordmine", StringComparison.OrdinalIgnoreCase))
+    {
+        HandleMineCommand();
+        return;
+    }
+
+    if (cmd.StartsWith("DEPTH ", StringComparison.OrdinalIgnoreCase))
+    {
+        double d;
+        if (double.TryParse(cmd.Substring(6).Trim(), out d) && d > 0)
+        {
+            recordMineDepth = d;
+            Echo($"Depth set to {recordMineDepth:0.0} m");
+        }
+        else Echo("Invalid depth value.");
+        return;
+    }
+
+    Echo($"Unknown command: {argument}");
+}
+
+void HandleMineCommand()
+{
+    switch (mineState)
+    {
+        case 0: // 1st run — save anchor waypoint, lock orientation, pause recording
+        {
+            Vector3D pos = rc.GetPosition();
+            Vector3D fwd = Vector3D.Normalize(rc.WorldMatrix.Forward);
+            Vector3D up  = Vector3D.Normalize(rc.WorldMatrix.Up);
+
+            recordIndex      = CountExistingRecords();
+            mineAnchorPos    = pos;
+            mineAnchorForward = fwd;
+            mineAnchorUp     = up;
+
+            string rec = FormatGpsRecord(recordIndex, pos, fwd, up);
+            AppendRecord(rec);
+
+            lockedForward     = fwd;
+            lockedUp          = up;
+            orientationLocked = true;
+            recording         = false;
+            mineState         = 1;
+
+            Echo("Mine 1/3: anchor saved. Orientation locked.\nFly to the TOP-LEFT corner of the area, then run pathrecordmine again.");
+            break;
+        }
+
+        case 1: // 2nd run — mark Corner A, enable soft movement lock
+        {
+            mineCornerA = rc.GetPosition();
+
+            slOrigin = mineCornerA;
+            slFwd    = lockedForward;
+            slUp     = lockedUp;
+            slRight  = Vector3D.Normalize(rc.WorldMatrix.Right); // ship right is definitive
+
+            softLockEnabled = true;
+            mineState       = 2;
+
+            Echo("Mine 2/3: Corner A marked. Movement locked to right+down.\nFly to the BOTTOM-RIGHT corner, then run pathrecordmine again.");
+            break;
+        }
+
+        case 2: // 3rd run — compose minearea record, fly back to anchor
+        {
+            Vector3D cornerB = rc.GetPosition();
+
+            string gpsA      = $"GPS:Corner A:{mineCornerA.X:0.00}:{mineCornerA.Y:0.00}:{mineCornerA.Z:0.00}:";
+            string gpsB      = $"GPS:Corner B:{cornerB.X:0.00}:{cornerB.Y:0.00}:{cornerB.Z:0.00}:";
+            string orient    = $"{lockedUp.X:0.0000},{lockedUp.Y:0.0000},{lockedUp.Z:0.0000}," +
+                               $"{lockedForward.X:0.0000},{lockedForward.Y:0.0000},{lockedForward.Z:0.0000}";
+            string mineRec   = $"{gpsA};{gpsB};{orient};{recordMineDepth:0.##}";
+
+            AppendRecord(mineRec, countAsWaypoint: false);
+
+            softLockEnabled = false;
+            returning       = true;
+            mineState       = 3;
+
+            Echo("Mine 3/3: area record saved. Returning to anchor...");
+            break;
+        }
+
+        case 3:
+            Echo("Still returning to anchor — please wait.");
+            break;
+    }
+}
+
+// ---- Auto-record ----
+
+void CheckAutoRecord()
+{
+    Vector3D pos = rc.GetPosition();
+    if (Vector3D.DistanceSquared(pos, lastRecordPos) >= recordStepMeters * recordStepMeters)
+    {
+        Vector3D fwd = Vector3D.Normalize(rc.WorldMatrix.Forward);
+        Vector3D up  = Vector3D.Normalize(rc.WorldMatrix.Up);
+        AppendRecord(FormatGpsRecord(recordIndex, pos, fwd, up));
+        lastRecordPos = pos;
+    }
+}
+
+string FormatGpsRecord(int index, Vector3D pos, Vector3D fwd, Vector3D up)
+{
+    return $"GPS:{(index + 1):D3}:{pos.X:0.00}:{pos.Y:0.00}:{pos.Z:0.00}:" +
+           $"|{up.X:0.0000},{up.Y:0.0000},{up.Z:0.0000}," +
+           $"{fwd.X:0.0000},{fwd.Y:0.0000},{fwd.Z:0.0000}";
+}
+
+void AppendRecord(string record, bool countAsWaypoint = true)
+{
+    var timer = FindTimer();
+    if (timer == null) { Echo($"No timer with tag '{recordTimerTag}' found."); return; }
+
+    string existing = timer.CustomData ?? "";
+    timer.CustomData = string.IsNullOrWhiteSpace(existing)
+        ? record
+        : existing.TrimEnd() + "\n" + record;
+
+    if (countAsWaypoint)
+        recordIndex++;
+}
+
+int CountExistingRecords()
+{
+    var timer = FindTimer();
+    if (timer == null) return 0;
+    string data = timer.CustomData ?? "";
+    if (string.IsNullOrWhiteSpace(data)) return 0;
+    return data.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries).Length;
+}
+
+IMyTimerBlock FindTimer()
+{
+    foreach (var t in GetBlocks<IMyTimerBlock>())
+    {
+        if (t != null && t.CustomName.IndexOf(recordTimerTag, StringComparison.OrdinalIgnoreCase) >= 0)
+            return t;
+    }
+    return null;
+}
+
+// ---- Soft movement lock ----
+// Keeps the ship on the plane through Corner A perpendicular to the drill axis,
+// and prevents it from going left of or above Corner A.
+// Movement right and downward is free.
+
+void ApplySoftLock()
+{
+    Vector3D pos     = rc.GetPosition();
+    Vector3D vel     = rc.GetShipVelocities().LinearVelocity;
+    Vector3D gravity = rc.GetNaturalGravity();
+
+    Vector3D delta  = pos - slOrigin;
+    double dFwd     = Vector3D.Dot(delta, slFwd);
+    double dRight   = Vector3D.Dot(delta, slRight);
+    double dUp      = Vector3D.Dot(delta, slUp);
+    double vFwd     = Vector3D.Dot(vel,   slFwd);
+    double vRight   = Vector3D.Dot(vel,   slRight);
+    double vUp      = Vector3D.Dot(vel,   slUp);
+
+    // PD correction in each forbidden direction.
+    // Allowed directions (right >= 0, up <= 0) receive no correction unless boundary is violated.
+    double corrFwd   = -dFwd * 4.0 - vFwd * 3.0;                          // hold depth plane
+    double corrRight = dRight < 0 ? -dRight * 4.0 - Math.Min(0, vRight) * 3.0 : 0; // left boundary
+    double corrUp    = dUp    > 0 ? -dUp   * 4.0 - Math.Max(0, vUp)    * 3.0 : 0; // top  boundary
+
+    Vector3D accel = corrFwd * slFwd + corrRight * slRight + corrUp * slUp + gravity;
+
+    if (accel.LengthSquared() > 0.01)
+        thrust.ApplyAccel(accel);
+    else
+        thrust.Reset();
+}
+
+// ---- Return to anchor after mine recording ----
+
+void ApplyReturn()
+{
+    Vector3D pos       = rc.GetPosition();
+    Vector3D toTarget  = mineAnchorPos - pos;
+    double   dist      = toTarget.Length();
+    double   tolerance = Math.Max(0.05, arrivalTolerance);
+
+    bool atPos   = dist < tolerance;
+    bool aligned = IsOrientationAligned(mineAnchorForward, mineAnchorUp, orientationToleranceDeg);
+
+    if (atPos && aligned)
+    {
+        thrust.Reset();
+        gyros.Reset();
+        returning         = false;
+        orientationLocked = false;
+        mineState         = 0;
+        recording         = true;
+        lastRecordPos     = rc.GetPosition();
+        Echo("Returned to anchor. Recording resumed.");
+        return;
+    }
+
+    if (!atPos)
+    {
+        Vector3D accel = thrust.ControlPosition(mineAnchorPos, Vector3D.Zero, 25.0);
+        thrust.ApplyAccel(accel);
+    }
+    else
+    {
+        thrust.Reset();
+    }
+}
+
+bool IsOrientationAligned(Vector3D forward, Vector3D up, double toleranceDeg)
+{
+    double   tol    = Math.Max(0.1, toleranceDeg) * Math.PI / 180.0;
+    double   minDot = Math.Cos(tol);
+    MatrixD  wm     = rc.WorldMatrix;
+    if (forward.LengthSquared() > 0.001 && Vector3D.Dot(wm.Forward, Vector3D.Normalize(forward)) < minDot) return false;
+    if (up.LengthSquared()      > 0.001 && Vector3D.Dot(wm.Up,      Vector3D.Normalize(up))      < minDot) return false;
+    return true;
+}
+
+// ---- Block helpers ----
+
+T GetBlock<T>(string name, bool useSubgrids = false) where T : class, IMyTerminalBlock
+{
+    if (useSubgrids) return GridTerminalSystem.GetBlockWithName(name) as T;
+    foreach (T b in GetBlocks<T>(false))
+        if (b.CustomName == name) return b;
+    return null;
+}
+
+T GetBlock<T>(bool useSubgrids = false) where T : class, IMyTerminalBlock
+{
+    return GetBlocks<T>(useSubgrids).FirstOrDefault();
+}
+
+List<T> GetBlocks<T>(bool useSubgrids = false) where T : class, IMyTerminalBlock
+{
+    var list = new List<T>();
+    if (useSubgrids)
+        GridTerminalSystem.GetBlocksOfType(list);
+    else
+        GridTerminalSystem.GetBlocksOfType(list, b => b.CubeGrid.EntityId == Me.CubeGrid.EntityId);
+    return list;
+}
+
+// ---- GyroControl (copied from EMM-A Miner) ----
+
+const double gyroP               = 10;
+const double gyroI               = 0;
+const double gyroD               = 5;
+const double gyroMax             = 1000;
+const double gyroErrorDeadbandRad = 0.003;
+const double gyroOutputDeadband  = 0.002;
+const double gyroFineDampRangeRad = 0.12;
+const double gyroRateLimit       = 0.35;
+
+class GyroControl
+{
+    private List<IMyGyro> gyros;
+    IMyCubeBlock rc;
+    VectorPID anglePID;
+
+    public GyroControl(IMyCubeBlock rc, UpdateFrequency tickSpeed, List<IMyGyro> gyros)
+    {
+        if (rc == null) throw new Exception("Reference block null.");
+        this.rc    = rc;
+        this.gyros = gyros;
+        double factor = tickSpeed == UpdateFrequency.Update10 ? 10 : tickSpeed == UpdateFrequency.Update100 ? 100 : 1;
+        double spt    = (1.0 / 60) * factor;
+        anglePID = new VectorPID(gyroP / factor, gyroI / factor, gyroD / factor, -gyroMax, gyroMax, spt);
+        Reset();
+    }
+
+    public void Reset()
+    {
+        for (int i = 0; i < gyros.Count; i++)
+        {
+            IMyGyro g = gyros[i];
+            if (g == null) { gyros.RemoveAtFast(i); continue; }
+            g.GyroOverride = false;
+        }
+        anglePID.Reset();
+    }
+
+    public void FaceVectors(Vector3D forward, Vector3D up)
+    {
+        Vector3D error  = -GetAngles(rc.WorldMatrix, forward, up);
+        Vector3D angles = new Vector3D(anglePID.Control(error));
+        ApplyFineDamping(error, ref angles);
+        ApplyGyroOverride(rc.WorldMatrix, angles);
+    }
+
+    Vector3D GetAngles(MatrixD current, Vector3D forward, Vector3D up)
+    {
+        Vector3D error = new Vector3D();
+        if (forward != Vector3D.Zero)
+        {
+            Quaternion q    = Quaternion.CreateFromForwardUp(current.Forward, current.Up);
+            Quaternion invQ = Quaternion.Inverse(q);
+            Vector3D   ref_ = Vector3D.Transform(forward, invQ);
+            Vector3D.GetAzimuthAndElevation(ref_, out error.Y, out error.X);
+        }
+        if (up != Vector3D.Zero)
+        {
+            Vector3D temp = Vector3D.Normalize(VectorRejection(up, current.Forward));
+            double   dot  = MathHelper.Clamp(Vector3D.Dot(current.Up, temp), -1, 1);
+            double   roll = Math.Acos(dot);
+            if (ScalerProjection(temp, current.Right) > 0) roll *= -1;
+            error.Z = roll;
+        }
+        if (Math.Abs(error.X) < 0.001) error.X = 0;
+        if (Math.Abs(error.Y) < 0.001) error.Y = 0;
+        if (Math.Abs(error.Z) < 0.001) error.Z = 0;
+        return error;
+    }
+
+    void ApplyFineDamping(Vector3D error, ref Vector3D angles)
+    {
+        if (Math.Abs(error.X) < gyroErrorDeadbandRad) angles.X = 0;
+        if (Math.Abs(error.Y) < gyroErrorDeadbandRad) angles.Y = 0;
+        if (Math.Abs(error.Z) < gyroErrorDeadbandRad) angles.Z = 0;
+        double errMag = error.Length();
+        if (errMag < gyroFineDampRangeRad)
+        {
+            double s = MathHelper.Clamp(errMag / gyroFineDampRangeRad, 0.2, 1.0);
+            angles *= s;
+        }
+        if (Math.Abs(angles.X) < gyroOutputDeadband) angles.X = 0;
+        if (Math.Abs(angles.Y) < gyroOutputDeadband) angles.Y = 0;
+        if (Math.Abs(angles.Z) < gyroOutputDeadband) angles.Z = 0;
+        angles.X = MathHelper.Clamp(angles.X, -gyroRateLimit, gyroRateLimit);
+        angles.Y = MathHelper.Clamp(angles.Y, -gyroRateLimit, gyroRateLimit);
+        angles.Z = MathHelper.Clamp(angles.Z, -gyroRateLimit, gyroRateLimit);
+    }
+
+    void ApplyGyroOverride(MatrixD current, Vector3D localAngles)
+    {
+        Vector3D worldAngles = Vector3D.TransformNormal(localAngles, current);
+        foreach (IMyGyro gyro in gyros)
+        {
+            Vector3D tv = Vector3D.TransformNormal(worldAngles, MatrixD.Transpose(gyro.WorldMatrix));
+            if (!tv.IsValid()) throw new Exception("Invalid gyro vector: " + tv);
+            gyro.Pitch = (float)tv.X;
+            gyro.Yaw   = (float)tv.Y;
+            gyro.Roll  = (float)tv.Z;
+            gyro.GyroOverride = true;
+        }
+    }
+
+    static double ScalerProjection(Vector3D value, Vector3D guide)
+    {
+        double r = Vector3D.Dot(value, guide);
+        return double.IsNaN(r) ? 0 : r;
+    }
+
+    static Vector3D VectorRejection(Vector3D value, Vector3D guide)
+    {
+        return value - ScalerProjection(value, guide) * guide;
+    }
+}
+
+// ---- ThrusterControl (copied from EMM-A Miner) ----
+
+const double thrustP     = 3;
+const double thrustI     = 2;
+const double thrustD     = 2;
+const double thrustDecay = 0.2;
+const float  minThrust   = 1.0000001f;
+
+class ThrusterControl
+{
+    private List<IMyThrust> thrusters;
+    IMyShipController rc;
+    VectorPID pid;
+
+    public ThrusterControl(IMyShipController rc, UpdateFrequency tickSpeed, List<IMyThrust> thrusters)
+    {
+        if (rc == null) throw new Exception("Ship controller null.");
+        this.rc        = rc;
+        this.thrusters = thrusters;
+        double factor  = tickSpeed == UpdateFrequency.Update10 ? 10 : tickSpeed == UpdateFrequency.Update100 ? 100 : 1;
+        double spt     = (1.0 / 60) * factor;
+        pid = new VectorPID(thrustP / factor, thrustI / factor, thrustD / factor, thrustDecay / factor, spt);
+        Reset();
+    }
+
+    public void Reset()
+    {
+        foreach (IMyThrust t in thrusters) t.ThrustOverride = 0;
+    }
+
+    public Vector3D ControlPosition(Vector3D targetPos, Vector3D targetVel, double maxSpeed = double.PositiveInfinity)
+    {
+        return ControlVelocity(targetVel + VectorClamp(-pid.Control(rc.GetPosition() - targetPos), maxSpeed));
+    }
+
+    Vector3D ControlVelocity(Vector3D targetVel)
+    {
+        Vector3D myVel  = rc.GetShipVelocities().LinearVelocity;
+        Vector3D deltaV = myVel - targetVel;
+        if (Vector3D.IsZero(deltaV)) return Vector3D.Zero;
+        return 2 * deltaV + rc.GetNaturalGravity();
+    }
+
+    Vector3D VectorClamp(Vector3D v, double max)
+    {
+        double len2 = v.LengthSquared();
+        if (len2 > max * max) v = (v / Math.Sqrt(len2)) * max;
+        return v;
+    }
+
+    public void ApplyAccel(Vector3D accel)
+    {
+        if (accel.Equals(Vector3D.Zero, 0.1)) accel = Vector3D.Zero;
+        Vector3D totalThrust = accel * rc.CalculateShipMass().TotalMass;
+        foreach (IMyThrust t in thrusters)
+        {
+            if (!t.IsFunctional) continue;
+            float output = (float)Vector3D.Dot(t.WorldMatrix.Forward, totalThrust);
+            if (output > 0)
+            {
+                float pct = MathHelper.Clamp(output / t.MaxEffectiveThrust, minThrust / t.MaxThrust, 1);
+                t.ThrustOverridePercentage = pct;
+                totalThrust -= t.WorldMatrix.Forward * pct * t.MaxEffectiveThrust;
+            }
+            else
+            {
+                t.ThrustOverride = minThrust;
+            }
+        }
+    }
+}
+
+// ---- PID (copied from EMM-A Miner) ----
+
+public class PID
+{
+    double _kP, _kI, _kD, _integralDecayRatio, _lowerBound, _upperBound;
+    double _timeStep, _inverseTimeStep, _errorSum, _lastError;
+    bool   _firstRun = true, _integralDecay;
+    public double Value { get; private set; }
+
+    public PID(double kP, double kI, double kD, double lowerBound, double upperBound, double timeStep)
+    {
+        _kP = kP; _kI = kI; _kD = kD;
+        _lowerBound = lowerBound; _upperBound = upperBound;
+        _timeStep = timeStep; _inverseTimeStep = 1 / timeStep;
+        _integralDecay = false;
+    }
+
+    public PID(double kP, double kI, double kD, double integralDecayRatio, double timeStep)
+    {
+        _kP = kP; _kI = kI; _kD = kD;
+        _integralDecayRatio = integralDecayRatio;
+        _timeStep = timeStep; _inverseTimeStep = 1 / timeStep;
+        _integralDecay = true;
+    }
+
+    public double Control(double error)
+    {
+        double deriv = (error - _lastError) * _inverseTimeStep;
+        if (_firstRun) { deriv = 0; _firstRun = false; }
+        if (!_integralDecay)
+        {
+            _errorSum += error * _timeStep;
+            _errorSum  = MathHelper.Clamp(_errorSum, _lowerBound, _upperBound);
+        }
+        else _errorSum = _errorSum * (1.0 - _integralDecayRatio) + error * _timeStep;
+        _lastError = error;
+        Value = _kP * error + _kI * _errorSum + _kD * deriv;
+        return Value;
+    }
+
+    public void Reset() { _errorSum = 0; _lastError = 0; _firstRun = true; }
+}
+
+public class VectorPID
+{
+    PID X, Y, Z;
+
+    public VectorPID(double kP, double kI, double kD, double lower, double upper, double timeStep)
+    { X = new PID(kP,kI,kD,lower,upper,timeStep); Y = new PID(kP,kI,kD,lower,upper,timeStep); Z = new PID(kP,kI,kD,lower,upper,timeStep); }
+
+    public VectorPID(double kP, double kI, double kD, double decayRatio, double timeStep)
+    { X = new PID(kP,kI,kD,decayRatio,timeStep); Y = new PID(kP,kI,kD,decayRatio,timeStep); Z = new PID(kP,kI,kD,decayRatio,timeStep); }
+
+    public Vector3D Control(Vector3D error) => new Vector3D(X.Control(error.X), Y.Control(error.Y), Z.Control(error.Z));
+    public void     Reset()                 { X.Reset(); Y.Reset(); Z.Reset(); }
+}
