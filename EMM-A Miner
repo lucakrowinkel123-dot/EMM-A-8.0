@@ -1,4 +1,3 @@
-
 // Autopilot Script
 
 // ============= Settings ==============
@@ -143,14 +142,9 @@ public Program ()
     drills = GetBlocks<IMyShipDrill>();
 
     if (tickSpeed == UpdateFrequency.Update10)
-        secondsPerTick = 10.0 / 60.0;
+    { secondsPerTick = 10.0 / 60.0; echoFrequency = 10; }
     else if (tickSpeed == UpdateFrequency.Update100)
-        secondsPerTick = 100.0 / 60.0;
-
-    if (tickSpeed == UpdateFrequency.Update10)
-        echoFrequency = 10;
-    else if (tickSpeed == UpdateFrequency.Update100)
-        echoFrequency = 1;
+    { secondsPerTick = 100.0 / 60.0; echoFrequency = 1; }
 
     LoadState();
     InitializeMineIndicatorSensors();
@@ -226,7 +220,6 @@ void WriteEcho()
     Echo(sb.ToString());
 }
 
-
 void Move ()
 {
     Vector3D worldOffset = GetTargetOffsetWorld();
@@ -273,23 +266,26 @@ Vector3D GetTargetOffsetWorld()
 
 bool IsOrientationAligned(Vector3D forward, Vector3D up, double toleranceDeg)
 {
-    double tol = Math.Max(0.1, toleranceDeg) * Math.PI / 180.0;
-    double minDot = Math.Cos(tol);
+    double minDot = Math.Cos(Math.Max(0.1, toleranceDeg) * Math.PI / 180.0);
     MatrixD wm = rc.WorldMatrix;
-
-    if (forward.LengthSquared() > 0.001)
-    {
-        Vector3D f = Vector3D.Normalize(forward);
-        if (Vector3D.Dot(wm.Forward, f) < minDot)
-            return false;
-    }
-    if (up.LengthSquared() > 0.001)
-    {
-        Vector3D u = Vector3D.Normalize(up);
-        if (Vector3D.Dot(wm.Up, u) < minDot)
-            return false;
-    }
+    if (forward.LengthSquared() > 0.001 && Vector3D.Dot(wm.Forward, Vector3D.Normalize(forward)) < minDot)
+        return false;
+    if (up.LengthSquared() > 0.001 && Vector3D.Dot(wm.Up, Vector3D.Normalize(up)) < minDot)
+        return false;
     return true;
+}
+
+bool TrySetPositiveDouble(string cmd, int skip, ref double field, string label, string unit = "m/s", double minVal = 0, string fmt = "0.00")
+{
+    double v;
+    if (double.TryParse(cmd.Substring(skip).Trim(), out v) && v > minVal)
+    {
+        field = v;
+        Echo(label + " set to " + field.ToString(fmt) + " " + unit);
+        return true;
+    }
+    Echo("Invalid " + label + " value.");
+    return false;
 }
 
 void RemoteCommand (string command)
@@ -314,51 +310,22 @@ void RemoteCommand (string command)
 
     if (trimmed.StartsWith("SPEEDF ", StringComparison.OrdinalIgnoreCase))
     {
-        double v;
-        if (double.TryParse(trimmed.Substring(7).Trim(), out v) && v > 0)
-        {
-            SPEEDF = v;
-            Echo($"SPEEDF set to {SPEEDF:0.00} m/s");
-        }
-        else
-            Echo("Invalid SPEEDF value.");
+        TrySetPositiveDouble(trimmed, 7, ref SPEEDF, "SPEEDF");
         return;
     }
-
     if (trimmed.StartsWith("SPEEDB ", StringComparison.OrdinalIgnoreCase))
     {
-        double v;
-        if (double.TryParse(trimmed.Substring(7).Trim(), out v) && v > 0)
-        {
-            SPEEDB = v;
-            Echo($"SPEEDB set to {SPEEDB:0.00} m/s");
-        }
-        else
-            Echo("Invalid SPEEDB value.");
+        TrySetPositiveDouble(trimmed, 7, ref SPEEDB, "SPEEDB");
         return;
     }
     if (trimmed.StartsWith("MINEH ", StringComparison.OrdinalIgnoreCase))
     {
-        double v;
-        if (double.TryParse(trimmed.Substring(6).Trim(), out v) && v > 0)
-        {
-            MINEH = v;
-            Echo($"MINEH set to {MINEH:0.00} m");
-        }
-        else
-            Echo("Invalid MINEH value.");
+        TrySetPositiveDouble(trimmed, 6, ref MINEH, "MINEH", "m");
         return;
     }
     if (trimmed.StartsWith("MINEW ", StringComparison.OrdinalIgnoreCase))
     {
-        double v;
-        if (double.TryParse(trimmed.Substring(6).Trim(), out v) && v > 0)
-        {
-            MINEW = v;
-            Echo($"MINEW set to {MINEW:0.00} m");
-        }
-        else
-            Echo("Invalid MINEW value.");
+        TrySetPositiveDouble(trimmed, 6, ref MINEW, "MINEW", "m");
         return;
     }
     if (trimmed.StartsWith("DEPTHMODE ", StringComparison.OrdinalIgnoreCase))
@@ -394,26 +361,12 @@ void RemoteCommand (string command)
     }
     if (trimmed.StartsWith("PATHRECORDMETERS ", StringComparison.OrdinalIgnoreCase))
     {
-        double v;
-        if (double.TryParse(trimmed.Substring(17).Trim(), out v) && v > 0.1)
-        {
-            pathRecordMeters = v;
-            Echo($"PATHRECORDMETERS set to {pathRecordMeters:0.0} m");
-        }
-        else
-            Echo("Invalid PATHRECORDMETERS value.");
+        TrySetPositiveDouble(trimmed, 17, ref pathRecordMeters, "PATHRECORDMETERS", "m", 0.1, "0.0");
         return;
     }
     if (trimmed.StartsWith("PATHRECORDDEPTH ", StringComparison.OrdinalIgnoreCase))
     {
-        double v;
-        if (double.TryParse(trimmed.Substring(16).Trim(), out v) && v > 0)
-        {
-            pathRecordMineDepth = v;
-            Echo($"PATHRECORDDEPTH set to {pathRecordMineDepth:0.0} m");
-        }
-        else
-            Echo("Invalid PATHRECORDDEPTH value.");
+        TrySetPositiveDouble(trimmed, 16, ref pathRecordMineDepth, "PATHRECORDDEPTH", "m", 0, "0.0");
         return;
     }
     if (trimmed.StartsWith("pathrecordstart", StringComparison.OrdinalIgnoreCase))
@@ -708,14 +661,19 @@ void HandlePathRecordMineStep()
     Echo("Mine area saved. Returning to entry point...");
 }
 
+string FormatCurrentGps(string name)
+{
+    Vector3D p = rc.GetPosition();
+    Vector3D f = Vector3D.Normalize(rc.WorldMatrix.Forward);
+    Vector3D u = Vector3D.Normalize(rc.WorldMatrix.Up);
+    return $"GPS:{name}:{p.X:0.00}:{p.Y:0.00}:{p.Z:0.00}:|{u.X:0.0000},{u.Y:0.0000},{u.Z:0.0000},{f.X:0.0000},{f.Y:0.0000},{f.Z:0.0000}";
+}
+
 void SavePathGpsRecord()
 {
     pathRecordCounter++;
     string idx = pathRecordCounter.ToString("000");
-    Vector3D p = rc.GetPosition();
-    Vector3D f = Vector3D.Normalize(rc.WorldMatrix.Forward);
-    Vector3D u = Vector3D.Normalize(rc.WorldMatrix.Up);
-    string line = $"GPS:{idx}:{p.X:0.00}:{p.Y:0.00}:{p.Z:0.00}:|{u.X:0.0000},{u.Y:0.0000},{u.Z:0.0000},{f.X:0.0000},{f.Y:0.0000},{f.Z:0.0000}";
+    string line = FormatCurrentGps(idx);
     if (AppendPathRecordLine(line))
         Echo($"Path point saved: {idx}");
     else
@@ -747,45 +705,34 @@ bool AppendPathRecordLine(string line)
 
 IMyTimerBlock FindPathTimer()
 {
-    List<IMyTimerBlock> timers = GetBlocks<IMyTimerBlock>();
-    foreach (var t in timers)
-    {
-        if (t == null || string.IsNullOrWhiteSpace(t.CustomName))
-            continue;
-        if (t.CustomName.IndexOf(pathTimerTag, StringComparison.OrdinalIgnoreCase) >= 0)
+    foreach (var t in GetBlocks<IMyTimerBlock>())
+        if (t != null && !string.IsNullOrWhiteSpace(t.CustomName) &&
+            t.CustomName.IndexOf(pathTimerTag, StringComparison.OrdinalIgnoreCase) >= 0)
             return t;
-    }
     return null;
+}
+
+List<IMySensorBlock> GetMineSensors()
+{
+    var result = new List<IMySensorBlock>();
+    foreach (var s in GetBlocks<IMySensorBlock>())
+        if (s != null && !string.IsNullOrWhiteSpace(s.CustomName) &&
+            s.CustomName.IndexOf(pathRecordMineSensorTag, StringComparison.OrdinalIgnoreCase) >= 0)
+            result.Add(s);
+    return result;
 }
 
 void SetMineIndicatorSensor(bool enabled)
 {
-    List<IMySensorBlock> sensors = GetBlocks<IMySensorBlock>();
-    foreach (var s in sensors)
-    {
-        if (s == null || string.IsNullOrWhiteSpace(s.CustomName))
-            continue;
-        if (s.CustomName.IndexOf(pathRecordMineSensorTag, StringComparison.OrdinalIgnoreCase) < 0)
-            continue;
+    foreach (var s in GetMineSensors())
         s.Enabled = enabled;
-    }
 }
 
 void InitializeMineIndicatorSensors()
 {
-    List<IMySensorBlock> sensors = GetBlocks<IMySensorBlock>();
-    foreach (var s in sensors)
+    foreach (var s in GetMineSensors())
     {
-        if (s == null || string.IsNullOrWhiteSpace(s.CustomName))
-            continue;
-        if (s.CustomName.IndexOf(pathRecordMineSensorTag, StringComparison.OrdinalIgnoreCase) < 0)
-            continue;
-
-        s.LeftExtend = 0.1f;
-        s.RightExtend = 0.1f;
-        s.TopExtend = 0.1f;
-        s.BottomExtend = 0.1f;
-        s.BackExtend = 0.1f;
+        s.LeftExtend = s.RightExtend = s.TopExtend = s.BottomExtend = s.BackExtend = 0.1f;
         s.FrontExtend = 50f;
     }
 }
@@ -900,27 +847,16 @@ bool ExecutePathRecord(string rawRecord)
         return miningEnabled;
     }
 
+    string navCmd = null;
     if (record.StartsWith("Nav;", StringComparison.OrdinalIgnoreCase))
-    {
-        Vector3D gps;
-        Vector3D forward;
-        Vector3D up;
-        if (!TryParseGpsCommand(record.Substring(4).Trim(), out gps, out forward, out up))
-            return false;
-        targetPosition = gps;
-        desiredForward = forward;
-        desiredUp = up;
-        hasTarget = true;
-        autopilotEnabled = true;
-        return true;
-    }
+        navCmd = record.Substring(4).Trim();
+    else if (record.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
+        navCmd = record;
 
-    if (record.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
+    if (navCmd != null)
     {
-        Vector3D gps;
-        Vector3D forward;
-        Vector3D up;
-        if (!TryParseGpsCommand(record, out gps, out forward, out up))
+        Vector3D gps, forward, up;
+        if (!TryParseGpsCommand(navCmd, out gps, out forward, out up))
             return false;
         targetPosition = gps;
         desiredForward = forward;
@@ -938,18 +874,7 @@ bool TryLoadPathRecordsFromTimer(out List<string> records, out string timerName)
     records = new List<string>();
     timerName = "";
 
-    List<IMyTimerBlock> timers = GetBlocks<IMyTimerBlock>();
-    IMyTimerBlock timer = null;
-    foreach (var t in timers)
-    {
-        if (t == null || string.IsNullOrWhiteSpace(t.CustomName))
-            continue;
-        if (t.CustomName.IndexOf(pathTimerTag, StringComparison.OrdinalIgnoreCase) >= 0)
-        {
-            timer = t;
-            break;
-        }
-    }
+    IMyTimerBlock timer = FindPathTimer();
     if (timer == null)
         return false;
 
@@ -1180,11 +1105,7 @@ bool TryParseVector3(string csv, out Vector3D value)
     if (t.Length != 3)
         return false;
     double x, y, z;
-    if (!double.TryParse(t[0].Trim(), out x))
-        return false;
-    if (!double.TryParse(t[1].Trim(), out y))
-        return false;
-    if (!double.TryParse(t[2].Trim(), out z))
+    if (!double.TryParse(t[0].Trim(), out x) || !double.TryParse(t[1].Trim(), out y) || !double.TryParse(t[2].Trim(), out z))
         return false;
     value = new Vector3D(x, y, z);
     return true;
@@ -1202,15 +1123,9 @@ bool TryParsePoint(string text, out Vector3D value)
         string[] parts = t.Split(':');
         if (parts.Length < 5)
             return false;
-
         double x, y, z;
-        if (!double.TryParse(parts[2], out x))
+        if (!double.TryParse(parts[2], out x) || !double.TryParse(parts[3], out y) || !double.TryParse(parts[4], out z))
             return false;
-        if (!double.TryParse(parts[3], out y))
-            return false;
-        if (!double.TryParse(parts[4], out z))
-            return false;
-
         value = new Vector3D(x, y, z);
         return true;
     }
@@ -1488,10 +1403,6 @@ void SetDrills(bool enabled)
 
 void DumpCurrentGpsToCustomData()
 {
-    Vector3D p = rc.GetPosition();
-    Vector3D f = Vector3D.Normalize(rc.WorldMatrix.Forward);
-    Vector3D u = Vector3D.Normalize(rc.WorldMatrix.Up);
-
     StringBuilder sb = new StringBuilder();
     string existing = Me.CustomData ?? "";
     if (!string.IsNullOrWhiteSpace(existing))
@@ -1500,7 +1411,7 @@ void DumpCurrentGpsToCustomData()
     sb.AppendLine();
     sb.AppendLine();
     sb.AppendLine("[AutopilotDump]");
-    sb.AppendLine($"GPS:Here:{p.X:0.00}:{p.Y:0.00}:{p.Z:0.00}:|{u.X:0.0000},{u.Y:0.0000},{u.Z:0.0000},{f.X:0.0000},{f.Y:0.0000},{f.Z:0.0000}");
+    sb.AppendLine(FormatCurrentGps("Here"));
 
     Me.CustomData = sb.ToString();
     Echo("Dumped GPS/orientation to Custom Data.");
@@ -1645,11 +1556,7 @@ bool TryParseGpsCommand(string command, out Vector3D gps, out Vector3D forward, 
         return false;
 
     double x, y, z;
-    if (!double.TryParse(gpsTokens[2], out x))
-        return false;
-    if (!double.TryParse(gpsTokens[3], out y))
-        return false;
-    if (!double.TryParse(gpsTokens[4], out z))
+    if (!double.TryParse(gpsTokens[2], out x) || !double.TryParse(gpsTokens[3], out y) || !double.TryParse(gpsTokens[4], out z))
         return false;
 
     gps = new Vector3D(x, y, z);
@@ -1702,19 +1609,11 @@ bool TryParseGpsCommand(string command, out Vector3D gps, out Vector3D forward, 
 T GetBlock<T> (string name, bool useSubgrids = false) where T : class, IMyTerminalBlock
 {
     if (useSubgrids)
-    {
         return GridTerminalSystem.GetBlockWithName(name) as T;
-    }
-    else
-    {
-        List<T> blocks = GetBlocks<T>(false);
-        foreach (T block in blocks)
-        {
-            if (block.CustomName == name)
-                return block;
-        }
-        return null;
-    }
+    foreach (T block in GetBlocks<T>(false))
+        if (block.CustomName == name)
+            return block;
+    return null;
 }
 T GetBlock<T> (bool useSubgrids = false) where T : class, IMyTerminalBlock
 {
