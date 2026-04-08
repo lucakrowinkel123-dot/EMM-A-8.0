@@ -153,6 +153,7 @@ public Program ()
         echoFrequency = 1;
 
     LoadState();
+    InitializeMineIndicatorSensors();
     Echo("Ready.");
     Runtime.UpdateFrequency = tickSpeed;
 }
@@ -767,6 +768,25 @@ void SetMineIndicatorSensor(bool enabled)
         if (s.CustomName.IndexOf(pathRecordMineSensorTag, StringComparison.OrdinalIgnoreCase) < 0)
             continue;
         s.Enabled = enabled;
+    }
+}
+
+void InitializeMineIndicatorSensors()
+{
+    List<IMySensorBlock> sensors = GetBlocks<IMySensorBlock>();
+    foreach (var s in sensors)
+    {
+        if (s == null || string.IsNullOrWhiteSpace(s.CustomName))
+            continue;
+        if (s.CustomName.IndexOf(pathRecordMineSensorTag, StringComparison.OrdinalIgnoreCase) < 0)
+            continue;
+
+        s.LeftExtend = 0.1f;
+        s.RightExtend = 0.1f;
+        s.TopExtend = 0.1f;
+        s.BottomExtend = 0.1f;
+        s.BackExtend = 0.1f;
+        s.FrontExtend = 50f;
     }
 }
 
