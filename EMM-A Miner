@@ -122,6 +122,13 @@ double secondsPerTick = 1.0 / 60.0;
 readonly int echoFrequency = 100; // every 100th game tick
 int runtime = 0;
 
+// Cached block/item lists reused by GetOreAmount to avoid per-call GTS scans and allocations
+List<IMyTerminalBlock> _invBlocks = new List<IMyTerminalBlock>();
+List<MyInventoryItem> _invItems = new List<MyInventoryItem>();
+bool _invCached = false;
+// Cached path timer reference to avoid repeated GTS scans during path recording
+IMyTimerBlock _cachedPathTimer;
+
 public Program ()
 {
     // Prioritize the given cockpit name
@@ -701,10 +708,17 @@ bool AppendPathRecordLine(string line)
 
 IMyTimerBlock FindPathTimer()
 {
+    if (_cachedPathTimer != null &&
+        _cachedPathTimer.CustomName.IndexOf(pathTimerTag, StringComparison.OrdinalIgnoreCase) >= 0)
+        return _cachedPathTimer;
     foreach (var t in GetBlocks<IMyTimerBlock>())
         if (t != null && !string.IsNullOrWhiteSpace(t.CustomName) &&
             t.CustomName.IndexOf(pathTimerTag, StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            _cachedPathTimer = t;
             return t;
+        }
+    _cachedPathTimer = null;
     return null;
 }
 
@@ -934,6 +948,7 @@ void StartSingleLaneMining(string command)
     autopilotEnabled = true;
     miningEnabled = true;
     miningState = MiningState.EnterLane;
+    _invCached = false; // refresh inventory block list for ore tracking
     ResetDepthAutoTracker();
     Echo($"Mining lane started. Depth={laneDepth:0.00}m");
 }
@@ -999,6 +1014,7 @@ void StartAreaMining(string command)
     autopilotEnabled = true;
     miningEnabled = true;
     miningState = MiningState.EnterLane;
+    _invCached = false; // refresh inventory block list for ore tracking
     ResetDepthAutoTracker();
 
     Echo($"Area mining started. Lanes={areaLaneAnchors.Count}, depth={laneDepth:0.00}m");
@@ -1296,24 +1312,32 @@ bool ShouldFinishDrillForward()
     return depthProgress >= laneDepth && noOreGainTicks >= noOreGainTickLimit;
 }
 
+void RefreshInventoryCache()
+{
+    _invBlocks.Clear();
+    GridTerminalSystem.GetBlocksOfType(_invBlocks, b => b.CubeGrid.EntityId == Me.CubeGrid.EntityId && b.HasInventory);
+    _invCached = true;
+}
+
 double GetOreAmount(bool includeStone)
 {
-    List<IMyTerminalBlock> blocks = new List<IMyTerminalBlock>();
-    GridTerminalSystem.GetBlocksOfType(blocks, b => b.CubeGrid.EntityId == Me.CubeGrid.EntityId && b.HasInventory);
+    if (!_invCached)
+        RefreshInventoryCache();
 
     double total = 0;
-    List<MyInventoryItem> items = new List<MyInventoryItem>();
-    foreach (var block in blocks)
+    foreach (var block in _invBlocks)
     {
+        if (block == null || !block.IsFunctional)
+            continue;
         int invCount = block.InventoryCount;
         for (int i = 0; i < invCount; i++)
         {
             var inv = block.GetInventory(i);
             if (inv == null)
                 continue;
-            items.Clear();
-            inv.GetItems(items);
-            foreach (var item in items)
+            _invItems.Clear();
+            inv.GetItems(_invItems);
+            foreach (var item in _invItems)
             {
                 if (!string.Equals(item.Type.TypeId, "MyObjectBuilder_Ore", StringComparison.OrdinalIgnoreCase))
                     continue;
@@ -1462,6 +1486,20 @@ void SaveState()
     sb.AppendLine("pathCount=" + pathRecords.Count);
     for (int i = 0; i < pathRecords.Count; i++)
         sb.AppendLine("pathRecord" + i + "=" + pathRecords[i]);
+    sb.AppendLine("pathRecordingEnabled=" + (pathRecordingEnabled ? "1" : "0"));
+    sb.AppendLine("pathRecordingPaused=" + (pathRecordingPaused ? "1" : "0"));
+    sb.AppendLine("pathRecordingWaitReturn=" + (pathRecordingWaitReturn ? "1" : "0"));
+    sb.AppendLine("pathRecordLastPos=" + V3ToString(pathRecordLastPos));
+    sb.AppendLine("pathRecordCounter=" + pathRecordCounter);
+    sb.AppendLine("pathRecordMineCounter=" + pathRecordMineCounter);
+    sb.AppendLine("pathRecordMineEntry=" + V3ToString(pathRecordMineEntry));
+    sb.AppendLine("pathRecordMineCornerA=" + V3ToString(pathRecordMineCornerA));
+    sb.AppendLine("pathRecordMineUp=" + V3ToString(pathRecordMineUp));
+    sb.AppendLine("pathRecordMineForward=" + V3ToString(pathRecordMineForward));
+    sb.AppendLine("pathRecordMineStage=" + (int)pathRecordMineStage);
+    sb.AppendLine("pathRecordMeters=" + pathRecordMeters.ToString("R"));
+    sb.AppendLine("pathRecordMineDepth=" + pathRecordMineDepth.ToString("R"));
+    sb.AppendLine("cockpitGyroForcedOff=" + (cockpitGyroControlForcedOff ? "1" : "0"));
     Storage = sb.ToString();
 }
 
@@ -1529,6 +1567,21 @@ void LoadState()
         }
     }
 
+    if (dict.TryGetValue("pathRecordingEnabled", out s)) pathRecordingEnabled = s == "1";
+    if (dict.TryGetValue("pathRecordingPaused", out s)) pathRecordingPaused = s == "1";
+    if (dict.TryGetValue("pathRecordingWaitReturn", out s)) pathRecordingWaitReturn = s == "1";
+    if (dict.TryGetValue("pathRecordLastPos", out s) && TryParseV3(s, out v)) pathRecordLastPos = v;
+    if (dict.TryGetValue("pathRecordCounter", out s) && int.TryParse(s, out n)) pathRecordCounter = n;
+    if (dict.TryGetValue("pathRecordMineCounter", out s) && int.TryParse(s, out n)) pathRecordMineCounter = n;
+    if (dict.TryGetValue("pathRecordMineEntry", out s) && TryParseV3(s, out v)) pathRecordMineEntry = v;
+    if (dict.TryGetValue("pathRecordMineCornerA", out s) && TryParseV3(s, out v)) pathRecordMineCornerA = v;
+    if (dict.TryGetValue("pathRecordMineUp", out s) && TryParseV3(s, out v)) pathRecordMineUp = v;
+    if (dict.TryGetValue("pathRecordMineForward", out s) && TryParseV3(s, out v)) pathRecordMineForward = v;
+    if (dict.TryGetValue("pathRecordMineStage", out s) && int.TryParse(s, out n)) pathRecordMineStage = (PathRecordMineStage)n;
+    if (dict.TryGetValue("pathRecordMeters", out s) && double.TryParse(s, out d)) pathRecordMeters = d;
+    if (dict.TryGetValue("pathRecordMineDepth", out s) && double.TryParse(s, out d)) pathRecordMineDepth = d;
+    if (dict.TryGetValue("cockpitGyroForcedOff", out s)) cockpitGyroControlForcedOff = s == "1";
+
     // If drills were actively running when the reload happened, turn them back on
     // and reset the stuck monitor so the stuck timer starts fresh.
     if (miningEnabled && miningState == MiningState.DrillForward)
@@ -1537,6 +1590,14 @@ void LoadState()
         ResetStuckMonitor();
         ResetDepthAutoTracker();
     }
+
+    // Restore cockpit gyro override if path recording had it locked.
+    if (cockpitGyroControlForcedOff && rc.GetProperty("ControlGyros") != null)
+        rc.SetValueBool("ControlGyros", false);
+
+    // Restore mine indicator sensor if mid-recording-mine sequence.
+    if (pathRecordingEnabled && pathRecordMineStage != PathRecordMineStage.Idle)
+        SetMineIndicatorSensor(true);
 }
 
 bool TryParseGpsCommand(string command, out Vector3D gps, out Vector3D forward, out Vector3D up)
