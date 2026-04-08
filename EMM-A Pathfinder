@@ -1,0 +1,552 @@
+// EMM-A Pathfinder
+// Focused script for path recording + mine-area recording workflow.
+
+string cockpitName = "Cockpit";
+UpdateFrequency tickSpeed = UpdateFrequency.Update1;
+double defaultRecordStepMeters = 20.0;
+double defaultMineDepth = 30.0;
+
+double navArrivalTolerance = 0.5;
+double navMaxSpeed = 12.0;
+double lockMaxSpeed = 4.0;
+
+enum MineRecordStage
+{
+    Idle,
+    AwaitCornerA,
+    AwaitCornerB,
+    ReturningToResume
+}
+
+IMyShipController rc;
+List<IMyGyro> gyros = new List<IMyGyro>();
+List<IMyThrust> thrusters = new List<IMyThrust>();
+
+bool recording = false;
+bool recordingPaused = false;
+double recordStepMeters = 20.0;
+Vector3D lastRecordedPos = Vector3D.Zero;
+bool hasLastRecordedPos = false;
+int pathRecordIndex = 1;
+
+MineRecordStage mineStage = MineRecordStage.Idle;
+int mineAreaIndex = 1;
+double pendingMineDepth = 30.0;
+
+Vector3D lockedUp = Vector3D.Zero;
+Vector3D lockedForward = Vector3D.Zero;
+
+Vector3D returnPoint = Vector3D.Zero;
+bool hasReturnPoint = false;
+
+Vector3D mineCornerA = Vector3D.Zero;
+bool hasMineCornerA = false;
+
+const string cornerColor = "#FF75C9F1";
+
+public Program()
+{
+    rc = GridTerminalSystem.GetBlockWithName(cockpitName) as IMyShipController;
+    if (rc == null)
+        rc = GetBlock<IMyCockpit>();
+    if (rc == null)
+        rc = GetBlock<IMyRemoteControl>();
+    if (rc == null)
+        throw new Exception("No cockpit/remote control found. Set cockpitName.");
+
+    GridTerminalSystem.GetBlocksOfType(gyros, g => g.CubeGrid == rc.CubeGrid);
+    GridTerminalSystem.GetBlocksOfType(thrusters, t => t.CubeGrid == rc.CubeGrid);
+
+    recordStepMeters = defaultRecordStepMeters;
+    pendingMineDepth = defaultMineDepth;
+
+    LoadState();
+    Runtime.UpdateFrequency = tickSpeed;
+    Echo("Pathfinder ready.");
+}
+
+public void Save()
+{
+    SaveState();
+}
+
+public void Main(string argument, UpdateType updateSource)
+{
+    if ((updateSource & (UpdateType.Update1 | UpdateType.Update10 | UpdateType.Update100)) != 0)
+    {
+        Tick();
+        if ((Runtime.CurrentInstructionCount % 120) == 0)
+            SaveState();
+        WriteStatus();
+        return;
+    }
+
+    if (!string.IsNullOrWhiteSpace(argument))
+        HandleCommand(argument.Trim());
+
+    WriteStatus();
+}
+
+void Tick()
+{
+    if (mineStage == MineRecordStage.AwaitCornerB)
+    {
+        ApplyOrientationLock(lockedForward, lockedUp);
+        ApplySoftMovementLock(mineCornerA, lockedForward, lockedUp);
+    }
+    else if (mineStage == MineRecordStage.ReturningToResume)
+    {
+        ApplyOrientationLock(lockedForward, lockedUp);
+        bool reached = MoveToPoint(returnPoint, navMaxSpeed, navArrivalTolerance);
+        if (reached)
+        {
+            ResetMotion();
+            mineStage = MineRecordStage.Idle;
+            recordingPaused = false;
+            hasReturnPoint = false;
+            hasMineCornerA = false;
+            Echo("Mine area recorded. Recording resumed.");
+        }
+    }
+    else
+    {
+        ResetMotion();
+    }
+
+    if (recording && !recordingPaused)
+        AutoRecordTick();
+}
+
+void HandleCommand(string command)
+{
+    string lower = command.ToLowerInvariant();
+
+    if (lower.StartsWith("pathrecordstart"))
+    {
+        StartRecording(command);
+        return;
+    }
+
+    if (lower == "pathrecordstop")
+    {
+        recording = false;
+        recordingPaused = false;
+        mineStage = MineRecordStage.Idle;
+        hasMineCornerA = false;
+        hasReturnPoint = false;
+        ResetMotion();
+        Echo("Path recording stopped.");
+        SaveState();
+        return;
+    }
+
+    if (lower.StartsWith("pathrecordmine"))
+    {
+        HandlePathRecordMine(command);
+        SaveState();
+        return;
+    }
+
+    if (lower == "pathrecordstatus")
+    {
+        WriteStatus();
+        return;
+    }
+
+    if (lower == "pathrecordreset")
+    {
+        Me.CustomData = string.Empty;
+        pathRecordIndex = 1;
+        mineAreaIndex = 1;
+        hasLastRecordedPos = false;
+        Echo("CustomData cleared and counters reset.");
+        SaveState();
+        return;
+    }
+
+    Echo("Unknown command. Use pathrecordstart, pathrecordstop, pathrecordmine, pathrecordstatus, pathrecordreset.");
+}
+
+void StartRecording(string command)
+{
+    string[] parts = command.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+    if (parts.Length >= 2)
+    {
+        double parsed;
+        if (double.TryParse(parts[1], out parsed) && parsed > 0.5)
+            recordStepMeters = parsed;
+    }
+
+    recording = true;
+    recordingPaused = false;
+    mineStage = MineRecordStage.Idle;
+
+    Vector3D pos = rc.GetPosition();
+    RecordWaypoint(pos, rc.WorldMatrix.Up, rc.WorldMatrix.Forward);
+
+    lastRecordedPos = pos;
+    hasLastRecordedPos = true;
+
+    Echo($"Path recording started. step={recordStepMeters:0.0}m");
+    SaveState();
+}
+
+void AutoRecordTick()
+{
+    Vector3D pos = rc.GetPosition();
+    if (!hasLastRecordedPos)
+    {
+        RecordWaypoint(pos, rc.WorldMatrix.Up, rc.WorldMatrix.Forward);
+        lastRecordedPos = pos;
+        hasLastRecordedPos = true;
+        return;
+    }
+
+    if (Vector3D.Distance(pos, lastRecordedPos) >= recordStepMeters)
+    {
+        RecordWaypoint(pos, rc.WorldMatrix.Up, rc.WorldMatrix.Forward);
+        lastRecordedPos = pos;
+    }
+}
+
+void HandlePathRecordMine(string command)
+{
+    if (!recording)
+    {
+        Echo("Start path recording first: pathrecordstart");
+        return;
+    }
+
+    string[] parts = command.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+    if (parts.Length >= 2)
+    {
+        double parsed;
+        if (double.TryParse(parts[1], out parsed) && parsed > 0)
+            pendingMineDepth = parsed;
+    }
+
+    Vector3D curPos = rc.GetPosition();
+    Vector3D curUp = rc.WorldMatrix.Up;
+    Vector3D curForward = rc.WorldMatrix.Forward;
+
+    if (mineStage == MineRecordStage.Idle)
+    {
+        // 1st run: save a normal waypoint and arm corner capture.
+        RecordWaypoint(curPos, curUp, curForward);
+        recordingPaused = true;
+
+        lockedUp = Vector3D.Normalize(curUp);
+        lockedForward = Vector3D.Normalize(curForward);
+
+        returnPoint = curPos;
+        hasReturnPoint = true;
+        mineStage = MineRecordStage.AwaitCornerA;
+
+        Echo("pathrecordmine stage 1 done. Move to upper-left corner and run pathrecordmine again.");
+        return;
+    }
+
+    if (mineStage == MineRecordStage.AwaitCornerA)
+    {
+        // 2nd run: set corner A and enable lock.
+        mineCornerA = curPos;
+        hasMineCornerA = true;
+        mineStage = MineRecordStage.AwaitCornerB;
+
+        Echo("Corner A saved. Soft lock active (orientation + forward/back lock + no left/up past corner A). Move to opposite corner and run pathrecordmine again.");
+        return;
+    }
+
+    if (mineStage == MineRecordStage.AwaitCornerB)
+    {
+        if (!hasMineCornerA || !hasReturnPoint)
+        {
+            Echo("Mine capture state invalid. Restart with pathrecordmine.");
+            mineStage = MineRecordStage.Idle;
+            recordingPaused = false;
+            return;
+        }
+
+        // 3rd run: write minearea record and return to resume point.
+        Vector3D cornerB = curPos;
+        AppendRecord(BuildMineAreaRecord(mineCornerA, cornerB, lockedUp, lockedForward, pendingMineDepth));
+
+        mineAreaIndex++;
+        mineStage = MineRecordStage.ReturningToResume;
+        Echo("Mine area recorded. Returning to resume point...");
+        return;
+    }
+
+    if (mineStage == MineRecordStage.ReturningToResume)
+    {
+        Echo("Already returning to resume point.");
+    }
+}
+
+void RecordWaypoint(Vector3D pos, Vector3D up, Vector3D forward)
+{
+    string name = pathRecordIndex.ToString("000");
+    string gps = BuildWaypointRecord(name, pos, up, forward);
+    AppendRecord(gps);
+    pathRecordIndex++;
+}
+
+string BuildWaypointRecord(string name, Vector3D pos, Vector3D up, Vector3D forward)
+{
+    return string.Format(
+        "GPS:{0}:{1}:{2}:{3}:|{4},{5},{6},{7},{8},{9}",
+        name,
+        F2(pos.X), F2(pos.Y), F2(pos.Z),
+        F4(up.X), F4(up.Y), F4(up.Z),
+        F4(forward.X), F4(forward.Y), F4(forward.Z));
+}
+
+string BuildMineAreaRecord(Vector3D cornerA, Vector3D cornerB, Vector3D up, Vector3D forward, double depth)
+{
+    string a = BuildColoredGps($"Corner A{mineAreaIndex}", cornerA);
+    string b = BuildColoredGps($"Corner B{mineAreaIndex}", cornerB);
+    string orient = string.Format("{0},{1},{2},{3},{4},{5}",
+        F4(up.X), F4(up.Y), F4(up.Z),
+        F4(forward.X), F4(forward.Y), F4(forward.Z));
+
+    return string.Format("{0};{1};{2};{3}", a, b, orient, F0(depth));
+}
+
+string BuildColoredGps(string name, Vector3D pos)
+{
+    return string.Format("GPS:{0}:{1}:{2}:{3}:{4}:",
+        name, F2(pos.X), F2(pos.Y), F2(pos.Z), cornerColor);
+}
+
+void AppendRecord(string line)
+{
+    if (string.IsNullOrWhiteSpace(Me.CustomData))
+        Me.CustomData = line;
+    else
+        Me.CustomData = Me.CustomData.TrimEnd() + "\n" + line;
+}
+
+void ApplyOrientationLock(Vector3D forward, Vector3D up)
+{
+    Vector3D f = Vector3D.Normalize(forward);
+    Vector3D u = Vector3D.Normalize(up);
+
+    Vector3D e1 = Vector3D.Cross(rc.WorldMatrix.Forward, f);
+    Vector3D e2 = Vector3D.Cross(rc.WorldMatrix.Up, u);
+    Vector3D errorWorld = e1 + e2;
+
+    Vector3D angVel = rc.GetShipVelocities().AngularVelocity;
+    Vector3D cmdWorld = errorWorld * 8.0 - angVel * 1.5;
+
+    foreach (var g in gyros)
+    {
+        Vector3D local = Vector3D.TransformNormal(cmdWorld, MatrixD.Transpose(g.WorldMatrix));
+        g.GyroOverride = true;
+        g.Pitch = (float)local.X;
+        g.Yaw = (float)local.Y;
+        g.Roll = (float)local.Z;
+    }
+}
+
+void ApplySoftMovementLock(Vector3D cornerA, Vector3D forward, Vector3D up)
+{
+    MatrixD basis = MatrixD.CreateWorld(Vector3D.Zero, forward, up);
+
+    Vector3D delta = rc.GetPosition() - cornerA;
+    Vector3D local = Vector3D.TransformNormal(delta, MatrixD.Transpose(basis));
+
+    // Keep in a constrained plane/quadrant:
+    // X: Right (+) allowed, left (-) disallowed -> clamp min 0
+    // Y: Down (-) allowed, up (+) disallowed -> clamp max 0
+    // Z: Forward/back not allowed -> force 0
+    local.X = Math.Max(0, local.X);
+    local.Y = Math.Min(0, local.Y);
+    local.Z = 0;
+
+    Vector3D targetWorld = cornerA + basis.Right * local.X + basis.Up * local.Y;
+    MoveToPoint(targetWorld, lockMaxSpeed, 0.15);
+}
+
+bool MoveToPoint(Vector3D target, double maxSpeed, double tolerance)
+{
+    Vector3D pos = rc.GetPosition();
+    Vector3D to = target - pos;
+    double dist = to.Length();
+
+    if (dist <= tolerance)
+    {
+        ApplyAccel(Vector3D.Zero);
+        return true;
+    }
+
+    Vector3D vel = rc.GetShipVelocities().LinearVelocity;
+    Vector3D desiredVel = Vector3D.Zero;
+    if (dist > 0.001)
+        desiredVel = Vector3D.Normalize(to) * Math.Min(maxSpeed, Math.Sqrt(dist) * 2.5);
+
+    Vector3D gravity = rc.GetNaturalGravity();
+    Vector3D accelCmd = (desiredVel - vel) * 2.0 + gravity;
+    ApplyAccel(accelCmd);
+    return false;
+}
+
+void ApplyAccel(Vector3D accel)
+{
+    Vector3D thrustNeed = accel * rc.CalculateShipMass().TotalMass;
+
+    foreach (var t in thrusters)
+    {
+        if (!t.IsFunctional)
+            continue;
+
+        double along = Vector3D.Dot(t.WorldMatrix.Forward, thrustNeed);
+        if (along > 0.0)
+        {
+            float pct = (float)MathHelper.Clamp(along / Math.Max(1.0, t.MaxEffectiveThrust), 0, 1);
+            t.ThrustOverridePercentage = pct;
+            thrustNeed -= t.WorldMatrix.Forward * (pct * t.MaxEffectiveThrust);
+        }
+        else
+        {
+            t.ThrustOverridePercentage = 0;
+        }
+    }
+}
+
+void ResetMotion()
+{
+    foreach (var g in gyros)
+    {
+        g.GyroOverride = false;
+        g.Pitch = 0;
+        g.Yaw = 0;
+        g.Roll = 0;
+    }
+
+    foreach (var t in thrusters)
+        t.ThrustOverridePercentage = 0;
+}
+
+void WriteStatus()
+{
+    StringBuilder sb = new StringBuilder();
+    sb.AppendLine("EMM-A Pathfinder");
+    sb.AppendLine($"Recording: {(recording ? (recordingPaused ? "Paused" : "On") : "Off")}");
+    sb.AppendLine($"Step: {recordStepMeters:0.0} m");
+    sb.AppendLine($"Next waypoint #: {pathRecordIndex:000}");
+    sb.AppendLine($"Mine stage: {mineStage}");
+    sb.AppendLine($"Mine depth: {pendingMineDepth:0}");
+    sb.AppendLine("Commands:");
+    sb.AppendLine("pathrecordstart [stepMeters]");
+    sb.AppendLine("pathrecordstop");
+    sb.AppendLine("pathrecordmine [depth]");
+    sb.AppendLine("pathrecordstatus");
+    sb.AppendLine("pathrecordreset");
+    Echo(sb.ToString());
+}
+
+void SaveState()
+{
+    var sb = new StringBuilder();
+    sb.AppendLine(recording ? "1" : "0");
+    sb.AppendLine(recordingPaused ? "1" : "0");
+    sb.AppendLine(recordStepMeters.ToString("R"));
+    sb.AppendLine(pathRecordIndex.ToString());
+    sb.AppendLine(mineAreaIndex.ToString());
+    sb.AppendLine(((int)mineStage).ToString());
+    sb.AppendLine(pendingMineDepth.ToString("R"));
+    sb.AppendLine(VecS(lockedUp));
+    sb.AppendLine(VecS(lockedForward));
+    sb.AppendLine(VecS(returnPoint));
+    sb.AppendLine(hasReturnPoint ? "1" : "0");
+    sb.AppendLine(VecS(mineCornerA));
+    sb.AppendLine(hasMineCornerA ? "1" : "0");
+    sb.AppendLine(VecS(lastRecordedPos));
+    sb.AppendLine(hasLastRecordedPos ? "1" : "0");
+    Storage = sb.ToString();
+}
+
+void LoadState()
+{
+    if (string.IsNullOrWhiteSpace(Storage))
+        return;
+
+    string[] l = Storage.Split('\n');
+    int i = 0;
+
+    recording = ReadB(l, ref i);
+    recordingPaused = ReadB(l, ref i);
+    recordStepMeters = ReadD(l, ref i, defaultRecordStepMeters);
+    pathRecordIndex = (int)ReadD(l, ref i, 1);
+    mineAreaIndex = (int)ReadD(l, ref i, 1);
+    mineStage = (MineRecordStage)(int)ReadD(l, ref i, 0);
+    pendingMineDepth = ReadD(l, ref i, defaultMineDepth);
+    lockedUp = ReadV(l, ref i);
+    lockedForward = ReadV(l, ref i);
+    returnPoint = ReadV(l, ref i);
+    hasReturnPoint = ReadB(l, ref i);
+    mineCornerA = ReadV(l, ref i);
+    hasMineCornerA = ReadB(l, ref i);
+    lastRecordedPos = ReadV(l, ref i);
+    hasLastRecordedPos = ReadB(l, ref i);
+
+    if (recordStepMeters < 0.5)
+        recordStepMeters = defaultRecordStepMeters;
+    if (pendingMineDepth <= 0)
+        pendingMineDepth = defaultMineDepth;
+    if (pathRecordIndex < 1)
+        pathRecordIndex = 1;
+    if (mineAreaIndex < 1)
+        mineAreaIndex = 1;
+}
+
+bool ReadB(string[] l, ref int i)
+{
+    if (i >= l.Length)
+        return false;
+    return l[i++].Trim() == "1";
+}
+
+double ReadD(string[] l, ref int i, double fallback)
+{
+    if (i >= l.Length)
+        return fallback;
+    double d;
+    if (!double.TryParse(l[i++].Trim(), out d))
+        return fallback;
+    return d;
+}
+
+Vector3D ReadV(string[] l, ref int i)
+{
+    if (i >= l.Length)
+        return Vector3D.Zero;
+
+    string[] p = l[i++].Trim().Split(',');
+    if (p.Length != 3)
+        return Vector3D.Zero;
+
+    double x, y, z;
+    if (!double.TryParse(p[0], out x)) x = 0;
+    if (!double.TryParse(p[1], out y)) y = 0;
+    if (!double.TryParse(p[2], out z)) z = 0;
+    return new Vector3D(x, y, z);
+}
+
+string VecS(Vector3D v)
+{
+    return string.Format("{0},{1},{2}", v.X.ToString("R"), v.Y.ToString("R"), v.Z.ToString("R"));
+}
+
+string F2(double d) { return d.ToString("0.00"); }
+string F4(double d) { return d.ToString("0.0000"); }
+string F0(double d) { return Math.Round(d).ToString("0"); }
+
+T GetBlock<T>() where T : class
+{
+    List<T> blocks = new List<T>();
+    GridTerminalSystem.GetBlocksOfType(blocks);
+    if (blocks.Count == 0)
+        return null;
+    return blocks[0];
+}
