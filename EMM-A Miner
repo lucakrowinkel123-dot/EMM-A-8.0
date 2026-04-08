@@ -42,6 +42,9 @@ double TOFFU = -2.5; // target offset Up (m)
 double TOFFF = 0; // target offset Forward (m)
 string pathTimerTag = "Path";
 int maxStuckRetries = 3; // skip hole after this many stuck retries; 0 = retry forever
+double pathRecordMeters = 25.0;
+double pathRecordMineDepth = 30.0;
+string pathRecordMineSensorTag = "EMM-A";
 // =============================================
 
 IMyShipController rc;
@@ -94,6 +97,25 @@ bool pathPaused = false;
 bool pathPausedNavResume = false;
 List<string> pathRecords = new List<string>();
 int pathIndex = 0;
+bool pathRecordingEnabled = false;
+bool pathRecordingPaused = false;
+bool pathRecordingWaitReturn = false;
+bool cockpitGyroControlForcedOff = false;
+Vector3D pathRecordLastPos = Vector3D.Zero;
+int pathRecordCounter = 0;
+int pathRecordMineCounter = 0;
+Vector3D pathRecordMineEntry = Vector3D.Zero;
+Vector3D pathRecordMineCornerA = Vector3D.Zero;
+Vector3D pathRecordMineUp = Vector3D.Zero;
+Vector3D pathRecordMineForward = Vector3D.Zero;
+enum PathRecordMineStage
+{
+    Idle,
+    EntryCaptured,
+    CornerCaptured,
+    ReturningToEntry
+}
+PathRecordMineStage pathRecordMineStage = PathRecordMineStage.Idle;
 Vector3D stuckSamplePos = Vector3D.Zero;
 double stuckNoMoveSeconds = 0;
 int stuckRetryCount = 0;
@@ -154,9 +176,11 @@ public void Main (string argument, UpdateType updateSource)
         if (miningEnabled)
             UpdateMiningState();
 
+        bool usedSoftLock = UpdatePathRecordState();
+
         if (autopilotEnabled && hasTarget)
             Move();
-        else
+        else if (!usedSoftLock)
             ResetMovement();
 
         UpdatePathRunner();
@@ -188,6 +212,9 @@ void WriteEcho()
     sb.AppendLine($"MINEH/MINEW: {MINEH:0.00}/{MINEW:0.00} m");
     sb.AppendLine($"Depth mode: {depthMode}");
     sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
+    sb.AppendLine($"PathRecord: {(pathRecordingEnabled ? "ON" : "OFF")} {(pathRecordingPaused ? "(paused)" : "")} every {pathRecordMeters:0.0}m");
+    if (pathRecordMineStage != PathRecordMineStage.Idle)
+        sb.AppendLine($"PathRecordMine: {pathRecordMineStage}");
     if (areaMiningMode && areaLaneAnchors.Count > 0)
         sb.AppendLine($"Area lane: {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
     if (pathMode)
@@ -364,6 +391,45 @@ void RemoteCommand (string command)
             Echo("Invalid TOFF. Use: TOFF r,u,f");
         return;
     }
+    if (trimmed.StartsWith("PATHRECORDMETERS ", StringComparison.OrdinalIgnoreCase))
+    {
+        double v;
+        if (double.TryParse(trimmed.Substring(17).Trim(), out v) && v > 0.1)
+        {
+            pathRecordMeters = v;
+            Echo($"PATHRECORDMETERS set to {pathRecordMeters:0.0} m");
+        }
+        else
+            Echo("Invalid PATHRECORDMETERS value.");
+        return;
+    }
+    if (trimmed.StartsWith("PATHRECORDDEPTH ", StringComparison.OrdinalIgnoreCase))
+    {
+        double v;
+        if (double.TryParse(trimmed.Substring(16).Trim(), out v) && v > 0)
+        {
+            pathRecordMineDepth = v;
+            Echo($"PATHRECORDDEPTH set to {pathRecordMineDepth:0.0} m");
+        }
+        else
+            Echo("Invalid PATHRECORDDEPTH value.");
+        return;
+    }
+    if (trimmed.StartsWith("pathrecordstart", StringComparison.OrdinalIgnoreCase))
+    {
+        StartPathRecording(trimmed);
+        return;
+    }
+    if (trimmed.Equals("pathrecordstop", StringComparison.OrdinalIgnoreCase))
+    {
+        StopPathRecording();
+        return;
+    }
+    if (trimmed.Equals("pathrecordmine", StringComparison.OrdinalIgnoreCase))
+    {
+        HandlePathRecordMineStep();
+        return;
+    }
 
     switch (trimmed.ToLower())
     {
@@ -394,7 +460,13 @@ void RemoteCommand (string command)
             pathPausedNavResume = false;
             pathRecords.Clear();
             pathIndex = 0;
+            pathRecordingEnabled = false;
+            pathRecordingPaused = false;
+            pathRecordingWaitReturn = false;
+            pathRecordMineStage = PathRecordMineStage.Idle;
+            SetCockpitGyroControl(true);
             activeMaxSpeed = 0;
+            SetMineIndicatorSensor(false);
             SetDrills(false);
             ResetMovement();
             WriteEcho();
@@ -483,6 +555,239 @@ void RemoteCommand (string command)
             else if (trimmed.StartsWith("minearea;", StringComparison.OrdinalIgnoreCase))
                 StartAreaMining(trimmed);
             break;
+    }
+}
+
+void StartPathRecording(string command)
+{
+    string[] parts = command.Split(new[] { ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+    if (parts.Length > 1)
+    {
+        double v;
+        if (double.TryParse(parts[1], out v) && v > 0.1)
+            pathRecordMeters = v;
+    }
+
+    pathRecordingEnabled = true;
+    pathRecordingPaused = false;
+    pathRecordingWaitReturn = false;
+    pathRecordMineStage = PathRecordMineStage.Idle;
+    pathRecordLastPos = rc.GetPosition();
+    SavePathGpsRecord();
+    Echo($"Path recording started ({pathRecordMeters:0.0} m interval).");
+}
+
+void StopPathRecording()
+{
+    pathRecordingEnabled = false;
+    pathRecordingPaused = false;
+    pathRecordingWaitReturn = false;
+    pathRecordMineStage = PathRecordMineStage.Idle;
+    SetCockpitGyroControl(true);
+    SetMineIndicatorSensor(false);
+    Echo("Path recording stopped.");
+}
+
+bool UpdatePathRecordState()
+{
+    if (pathRecordingEnabled && !pathRecordingPaused && !pathRecordingWaitReturn)
+    {
+        Vector3D now = rc.GetPosition();
+        if (Vector3D.DistanceSquared(now, pathRecordLastPos) >= pathRecordMeters * pathRecordMeters)
+        {
+            SavePathGpsRecord();
+            pathRecordLastPos = now;
+        }
+    }
+
+    if (pathRecordingWaitReturn)
+    {
+        SetCockpitGyroControl(false);
+        if (IsAtTargetPose(pathRecordMineEntry, pathRecordMineForward, pathRecordMineUp))
+        {
+            autopilotEnabled = false;
+            hasTarget = false;
+            pathRecordingWaitReturn = false;
+            pathRecordingPaused = false;
+            pathRecordMineStage = PathRecordMineStage.Idle;
+            pathRecordLastPos = rc.GetPosition();
+            SetCockpitGyroControl(true);
+            SetMineIndicatorSensor(false);
+            Echo("Returned to mine entry. Path recording resumed.");
+        }
+        return false;
+    }
+
+    if (pathRecordMineStage == PathRecordMineStage.EntryCaptured)
+    {
+        SetCockpitGyroControl(false);
+        if (pathRecordMineUp.LengthSquared() > 0.001 && pathRecordMineForward.LengthSquared() > 0.001)
+            gyros.FaceVectors(pathRecordMineForward, pathRecordMineUp);
+        thrust.Reset();
+        return true;
+    }
+
+    if (pathRecordMineStage != PathRecordMineStage.CornerCaptured)
+    {
+        SetCockpitGyroControl(true);
+        return false;
+    }
+
+    SetCockpitGyroControl(false);
+    Vector3D up = pathRecordMineUp;
+    Vector3D forward = pathRecordMineForward;
+    if (up.LengthSquared() < 0.001 || forward.LengthSquared() < 0.001)
+        return false;
+    Vector3D right = Vector3D.Normalize(Vector3D.Cross(forward, up));
+    Vector3D down = -up;
+    Vector3D delta = rc.GetPosition() - pathRecordMineCornerA;
+    double r = Vector3D.Dot(delta, right);
+    double d = Vector3D.Dot(delta, down);
+    double f = Vector3D.Dot(delta, forward);
+    double clampedR = Math.Max(0, r);
+    double clampedD = Math.Max(0, d);
+    Vector3D allowed = pathRecordMineCornerA + right * clampedR + down * clampedD;
+    if (Math.Abs(f) < 0.05 && Vector3D.DistanceSquared(rc.GetPosition(), allowed) < 0.05 * 0.05)
+    {
+        gyros.FaceVectors(forward, up);
+        return false;
+    }
+
+    gyros.FaceVectors(forward, up);
+    thrust.ApplyAccel(thrust.ControlPosition(allowed, Vector3D.Zero, SPEEDB));
+    return true;
+}
+
+void HandlePathRecordMineStep()
+{
+    if (!pathRecordingEnabled)
+    {
+        Echo("Start path recording first: pathrecordstart");
+        return;
+    }
+
+    if (pathRecordMineStage == PathRecordMineStage.Idle)
+    {
+        SavePathGpsRecord();
+        pathRecordMineEntry = rc.GetPosition();
+        pathRecordMineUp = Vector3D.Normalize(rc.WorldMatrix.Up);
+        pathRecordMineForward = Vector3D.Normalize(rc.WorldMatrix.Forward);
+        pathRecordingPaused = true;
+        pathRecordMineStage = PathRecordMineStage.EntryCaptured;
+        SetMineIndicatorSensor(true);
+        Echo("Mine step 1/3 saved. Recording paused and orientation locked.");
+        return;
+    }
+
+    if (pathRecordMineStage == PathRecordMineStage.EntryCaptured)
+    {
+        pathRecordMineCornerA = rc.GetPosition();
+        pathRecordMineStage = PathRecordMineStage.CornerCaptured;
+        Echo("Mine step 2/3 saved. Soft lock active (right/down only).");
+        return;
+    }
+
+    Vector3D cornerB = rc.GetPosition();
+    pathRecordMineCounter++;
+    string rec = BuildMineAreaRecord(pathRecordMineCornerA, cornerB, pathRecordMineUp, pathRecordMineForward, pathRecordMineDepth, pathRecordMineCounter);
+    if (!AppendPathRecordLine(rec))
+    {
+        Echo($"Mine area record ready but timer tag '{pathTimerTag}' not found.");
+        return;
+    }
+
+    targetPosition = pathRecordMineEntry;
+    desiredUp = pathRecordMineUp;
+    desiredForward = pathRecordMineForward;
+    hasTarget = true;
+    autopilotEnabled = true;
+    activeMaxSpeed = SPEEDB;
+    pathRecordingWaitReturn = true;
+    pathRecordMineStage = PathRecordMineStage.ReturningToEntry;
+    Echo("Mine area saved. Returning to entry point...");
+}
+
+void SavePathGpsRecord()
+{
+    pathRecordCounter++;
+    string idx = pathRecordCounter.ToString("000");
+    Vector3D p = rc.GetPosition();
+    Vector3D f = Vector3D.Normalize(rc.WorldMatrix.Forward);
+    Vector3D u = Vector3D.Normalize(rc.WorldMatrix.Up);
+    string line = $"GPS:{idx}:{p.X:0.00}:{p.Y:0.00}:{p.Z:0.00}:|{u.X:0.0000},{u.Y:0.0000},{u.Z:0.0000},{f.X:0.0000},{f.Y:0.0000},{f.Z:0.0000}";
+    if (AppendPathRecordLine(line))
+        Echo($"Path point saved: {idx}");
+    else
+        Echo($"Could not save path point {idx}; timer tag '{pathTimerTag}' not found.");
+}
+
+string BuildMineAreaRecord(Vector3D cornerA, Vector3D cornerB, Vector3D up, Vector3D forward, double depth, int index)
+{
+    string suffix = index.ToString();
+    string color = "#FF75C9F1";
+    return
+        $"GPS:Corner A{suffix}:{cornerA.X:0.00}:{cornerA.Y:0.00}:{cornerA.Z:0.00}:{color}:;" +
+        $"GPS:Corner B{suffix}:{cornerB.X:0.00}:{cornerB.Y:0.00}:{cornerB.Z:0.00}:{color}:;" +
+        $"{up.X:0.0000},{up.Y:0.0000},{up.Z:0.0000},{forward.X:0.0000},{forward.Y:0.0000},{forward.Z:0.0000};" +
+        $"{depth:0.##}";
+}
+
+bool AppendPathRecordLine(string line)
+{
+    IMyTimerBlock timer = FindPathTimer();
+    if (timer == null)
+        return false;
+    string existing = timer.CustomData ?? "";
+    if (!string.IsNullOrWhiteSpace(existing) && !existing.EndsWith("\n"))
+        existing += "\n";
+    timer.CustomData = existing + line + "\n";
+    return true;
+}
+
+IMyTimerBlock FindPathTimer()
+{
+    List<IMyTimerBlock> timers = GetBlocks<IMyTimerBlock>();
+    foreach (var t in timers)
+    {
+        if (t == null || string.IsNullOrWhiteSpace(t.CustomName))
+            continue;
+        if (t.CustomName.IndexOf(pathTimerTag, StringComparison.OrdinalIgnoreCase) >= 0)
+            return t;
+    }
+    return null;
+}
+
+void SetMineIndicatorSensor(bool enabled)
+{
+    List<IMySensorBlock> sensors = GetBlocks<IMySensorBlock>();
+    foreach (var s in sensors)
+    {
+        if (s == null || string.IsNullOrWhiteSpace(s.CustomName))
+            continue;
+        if (s.CustomName.IndexOf(pathRecordMineSensorTag, StringComparison.OrdinalIgnoreCase) < 0)
+            continue;
+        s.Enabled = enabled;
+    }
+}
+
+void SetCockpitGyroControl(bool enabled)
+{
+    if (rc == null)
+        return;
+    if (enabled)
+    {
+        if (cockpitGyroControlForcedOff)
+        {
+            rc.ControlGyros = true;
+            cockpitGyroControlForcedOff = false;
+        }
+        return;
+    }
+
+    if (!cockpitGyroControlForcedOff)
+    {
+        rc.ControlGyros = false;
+        cockpitGyroControlForcedOff = true;
     }
 }
 
