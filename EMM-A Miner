@@ -774,11 +774,13 @@ void SetCockpitGyroControl(bool enabled)
 {
     if (rc == null)
         return;
+    if (rc.GetProperty("ControlGyros") == null)
+        return;
     if (enabled)
     {
         if (cockpitGyroControlForcedOff)
         {
-            rc.ControlGyros = true;
+            rc.SetValueBool("ControlGyros", true);
             cockpitGyroControlForcedOff = false;
         }
         return;
@@ -786,7 +788,7 @@ void SetCockpitGyroControl(bool enabled)
 
     if (!cockpitGyroControlForcedOff)
     {
-        rc.ControlGyros = false;
+        rc.SetValueBool("ControlGyros", false);
         cockpitGyroControlForcedOff = true;
     }
 }
