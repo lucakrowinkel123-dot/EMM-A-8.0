@@ -100,6 +100,7 @@ int pathIndex = 0;
 bool pathRecordingEnabled = false;
 bool pathRecordingPaused = false;
 bool pathRecordingWaitReturn = false;
+bool cockpitGyroControlForcedOff = false;
 Vector3D pathRecordLastPos = Vector3D.Zero;
 int pathRecordCounter = 0;
 int pathRecordMineCounter = 0;
@@ -111,7 +112,8 @@ enum PathRecordMineStage
 {
     Idle,
     EntryCaptured,
-    CornerCaptured
+    CornerCaptured,
+    ReturningToEntry
 }
 PathRecordMineStage pathRecordMineStage = PathRecordMineStage.Idle;
 Vector3D stuckSamplePos = Vector3D.Zero;
@@ -462,6 +464,7 @@ void RemoteCommand (string command)
             pathRecordingPaused = false;
             pathRecordingWaitReturn = false;
             pathRecordMineStage = PathRecordMineStage.Idle;
+            SetCockpitGyroControl(true);
             activeMaxSpeed = 0;
             SetMineIndicatorSensor(false);
             SetDrills(false);
@@ -580,6 +583,7 @@ void StopPathRecording()
     pathRecordingPaused = false;
     pathRecordingWaitReturn = false;
     pathRecordMineStage = PathRecordMineStage.Idle;
+    SetCockpitGyroControl(true);
     SetMineIndicatorSensor(false);
     Echo("Path recording stopped.");
 }
@@ -598,6 +602,7 @@ bool UpdatePathRecordState()
 
     if (pathRecordingWaitReturn)
     {
+        SetCockpitGyroControl(false);
         if (IsAtTargetPose(pathRecordMineEntry, pathRecordMineForward, pathRecordMineUp))
         {
             autopilotEnabled = false;
@@ -606,15 +611,29 @@ bool UpdatePathRecordState()
             pathRecordingPaused = false;
             pathRecordMineStage = PathRecordMineStage.Idle;
             pathRecordLastPos = rc.GetPosition();
+            SetCockpitGyroControl(true);
             SetMineIndicatorSensor(false);
             Echo("Returned to mine entry. Path recording resumed.");
         }
         return false;
     }
 
-    if (pathRecordMineStage != PathRecordMineStage.CornerCaptured)
-        return false;
+    if (pathRecordMineStage == PathRecordMineStage.EntryCaptured)
+    {
+        SetCockpitGyroControl(false);
+        if (pathRecordMineUp.LengthSquared() > 0.001 && pathRecordMineForward.LengthSquared() > 0.001)
+            gyros.FaceVectors(pathRecordMineForward, pathRecordMineUp);
+        thrust.Reset();
+        return true;
+    }
 
+    if (pathRecordMineStage != PathRecordMineStage.CornerCaptured)
+    {
+        SetCockpitGyroControl(true);
+        return false;
+    }
+
+    SetCockpitGyroControl(false);
     Vector3D up = pathRecordMineUp;
     Vector3D forward = pathRecordMineForward;
     if (up.LengthSquared() < 0.001 || forward.LengthSquared() < 0.001)
@@ -684,7 +703,7 @@ void HandlePathRecordMineStep()
     autopilotEnabled = true;
     activeMaxSpeed = SPEEDB;
     pathRecordingWaitReturn = true;
-    pathRecordMineStage = PathRecordMineStage.EntryCaptured;
+    pathRecordMineStage = PathRecordMineStage.ReturningToEntry;
     Echo("Mine area saved. Returning to entry point...");
 }
 
@@ -748,6 +767,27 @@ void SetMineIndicatorSensor(bool enabled)
         if (s.CustomName.IndexOf(pathRecordMineSensorTag, StringComparison.OrdinalIgnoreCase) < 0)
             continue;
         s.Enabled = enabled;
+    }
+}
+
+void SetCockpitGyroControl(bool enabled)
+{
+    if (rc == null)
+        return;
+    if (enabled)
+    {
+        if (cockpitGyroControlForcedOff)
+        {
+            rc.ControlGyros = true;
+            cockpitGyroControlForcedOff = false;
+        }
+        return;
+    }
+
+    if (!cockpitGyroControlForcedOff)
+    {
+        rc.ControlGyros = false;
+        cockpitGyroControlForcedOff = true;
     }
 }
 
