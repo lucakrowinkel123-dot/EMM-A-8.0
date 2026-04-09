@@ -562,9 +562,16 @@ bool UpdatePathRecordState()
     if (pathRecordMineWaitAreaComplete && !miningEnabled)
     {
         pathRecordMineWaitAreaComplete = false;
-        pathRecordingPaused = false;
-        pathRecordLastPos = rc.GetPosition();
-        Echo("PathRecord minearea complete. Path recording resumed.");
+        targetPosition = pathRecordMineEntry;
+        desiredUp = pathRecordMineUp;
+        desiredForward = pathRecordMineForward;
+        hasTarget = true;
+        autopilotEnabled = true;
+        activeMaxSpeed = SPEEDB;
+        pathRecordingWaitReturn = true;
+        pathRecordMineRunAreaAfterReturn = false;
+        pathRecordMineStage = PathRecordMineStage.ReturningToEntry;
+        Echo("PathRecord minearea complete. Returning to mine entry before resuming path recording...");
     }
 
     if (pathRecordingEnabled && !pathRecordingPaused && !pathRecordingWaitReturn)
