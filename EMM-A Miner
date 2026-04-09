@@ -12,6 +12,7 @@
 // nexthole : skip to the next generated area lane anchor
 // cancelmine : stops mining state machine and turns drills off
 // pathstart : loads records from timer with tag in pathTimerTag and executes row-by-row
+//            (records may include Nav/GPS, minearea, dock, undock)
 // pathpause : pauses queue and active movement; minearea returns to current anchor and waits
 // pathcontinue : resumes queue advancement after pathpause
 // pathstop : stops path mode and clears remaining queued records
@@ -22,8 +23,10 @@
 // DEPTHMODE <DEFAULT|ORE|ORESTONE> : depth behavior (fixed depth, auto stop on ore depletion, auto incl. stone)
 // TOFF r,u,f : sets target offset in local Right,Up,Forward meters
 // TOFFRESET : clears target offset
+// dock : start docking using latest pose received from dockChannel
 // dock;<GPS...|Ux,Uy,Uz,Fx,Fy,Fz> : two-step dock run (staging point then connector)
 // dockcancel : abort active dock run
+// undock : disconnect and move to staging point (50m below connector)
 // =====================================
 
 // ========== Editable Script Settings ==========
@@ -118,6 +121,10 @@ Vector3D dockConnectorPosition = Vector3D.Zero;
 Vector3D dockCarrierUp = Vector3D.Zero;
 IMyShipConnector minerConnector;
 IMyBroadcastListener dockListener;
+bool hasDockFeed = false;
+Vector3D dockFeedConnectorPos = Vector3D.Zero;
+Vector3D dockFeedUp = Vector3D.Zero;
+Vector3D dockFeedForward = Vector3D.Zero;
 Vector3D pathRecordLastPos = Vector3D.Zero;
 int pathRecordCounter = 0;
 int pathRecordMineCounter = 0;
@@ -232,12 +239,99 @@ void PollDockChannel()
         if (string.IsNullOrWhiteSpace(payload))
             continue;
 
-        if (dockState != DockState.Idle)
-            continue; // ignore new dock assignments while already docking
-
-        if (payload.StartsWith("dock;", StringComparison.OrdinalIgnoreCase))
-            StartDockRun(payload.Substring(5).Trim());
+        Vector3D connectorPos, forward, up;
+        if (!TryParseDockPayload(payload, out connectorPos, out forward, out up))
+            continue;
+        hasDockFeed = true;
+        dockFeedConnectorPos = connectorPos;
+        dockFeedForward = forward;
+        dockFeedUp = up;
     }
+}
+
+bool TryParseDockPayload(string payload, out Vector3D connectorPos, out Vector3D forward, out Vector3D up)
+{
+    connectorPos = Vector3D.Zero;
+    forward = Vector3D.Zero;
+    up = Vector3D.Zero;
+
+    if (string.IsNullOrWhiteSpace(payload))
+        return false;
+
+    string body = payload;
+    if (body.StartsWith("dock;", StringComparison.OrdinalIgnoreCase))
+        body = body.Substring(5).Trim();
+
+    return TryParseGpsCommand(body, out connectorPos, out forward, out up)
+           && up.LengthSquared() > 0.001
+           && forward.LengthSquared() > 0.001;
+}
+
+bool StartDockFromFeed()
+{
+    if (dockState != DockState.Idle)
+    {
+        Echo("Dock already in progress.");
+        return false;
+    }
+
+    if (!hasDockFeed)
+    {
+        Echo("No dock feed received yet.");
+        return false;
+    }
+
+    dockConnectorPosition = dockFeedConnectorPos;
+    dockCarrierUp = Vector3D.Normalize(dockFeedUp);
+    desiredForward = Vector3D.Normalize(dockFeedForward);
+    desiredUp = dockCarrierUp;
+    targetPosition = dockConnectorPosition - dockCarrierUp * dockStagingDistance;
+    hasTarget = true;
+    autopilotEnabled = true;
+    dockState = DockState.ToStaging;
+    activeMaxSpeed = 0;
+    if (miningEnabled)
+    {
+        miningEnabled = false;
+        miningState = MiningState.Idle;
+        SetDrills(false);
+    }
+    Echo($"Dock run started from feed. Staging {dockStagingDistance:0.0} m below connector.");
+    return true;
+}
+
+void StartUndockToStaging()
+{
+    Vector3D connectorPos = dockConnectorPosition;
+    Vector3D carrierUp = dockCarrierUp;
+    Vector3D carrierForward = desiredForward;
+
+    if (hasDockFeed)
+    {
+        connectorPos = dockFeedConnectorPos;
+        carrierUp = dockFeedUp;
+        carrierForward = dockFeedForward;
+    }
+
+    if (carrierUp.LengthSquared() < 0.001 || carrierForward.LengthSquared() < 0.001)
+    {
+        Echo("Cannot undock: no valid dock pose/feed.");
+        return;
+    }
+
+    if (minerConnector == null)
+        minerConnector = GetBlock<IMyShipConnector>(minerConnectorName, true);
+    if (minerConnector != null && minerConnector.Status == MyShipConnectorStatus.Connected)
+        minerConnector.Disconnect();
+
+    CancelDockRun("Dock state cleared for undock.");
+    desiredUp = Vector3D.Normalize(carrierUp);
+    desiredForward = Vector3D.Normalize(carrierForward);
+    targetPosition = connectorPos - desiredUp * dockStagingDistance;
+    hasTarget = true;
+    autopilotEnabled = true;
+    activeMaxSpeed = 0;
+    Echo($"Undocking to staging ({dockStagingDistance:0.0} m).");
 }
 
 void WriteEcho()
@@ -343,6 +437,12 @@ void ValidateDockSetup()
 
 bool StartDockRun(string dockArgs)
 {
+    if (dockState != DockState.Idle)
+    {
+        Echo("Dock already in progress.");
+        return false;
+    }
+
     Vector3D connectorPos, carrierForward, carrierUp;
     if (!TryParseGpsCommand(dockArgs, out connectorPos, out carrierForward, out carrierUp))
     {
@@ -476,6 +576,11 @@ void RemoteCommand (string command)
         StartDockRun(trimmed.Substring(5).Trim());
         return;
     }
+    if (trimmed.Equals("dock", StringComparison.OrdinalIgnoreCase))
+    {
+        StartDockFromFeed();
+        return;
+    }
     if (trimmed.Equals("dockcancel", StringComparison.OrdinalIgnoreCase))
     {
         CancelDockRun("Dock cancelled.", false);
@@ -483,6 +588,11 @@ void RemoteCommand (string command)
         autopilotEnabled = false;
         activeMaxSpeed = 0;
         ResetMovement();
+        return;
+    }
+    if (trimmed.Equals("undock", StringComparison.OrdinalIgnoreCase))
+    {
+        StartUndockToStaging();
         return;
     }
 
@@ -1062,6 +1172,25 @@ bool ExecutePathRecord(string rawRecord)
         record = record.Substring(1, record.Length - 2).Trim();
     if (string.IsNullOrWhiteSpace(record))
         return false;
+
+    if (record.Equals("dock", StringComparison.OrdinalIgnoreCase))
+        return StartDockFromFeed();
+
+    if (record.Equals("undock", StringComparison.OrdinalIgnoreCase))
+    {
+        StartUndockToStaging();
+        return autopilotEnabled && hasTarget;
+    }
+
+    if (record.Equals("dockcancel", StringComparison.OrdinalIgnoreCase))
+    {
+        CancelDockRun("Dock cancelled by path record.", false);
+        hasTarget = false;
+        autopilotEnabled = false;
+        activeMaxSpeed = 0;
+        ResetMovement();
+        return true;
+    }
 
     if (record.StartsWith("minearea;", StringComparison.OrdinalIgnoreCase))
     {

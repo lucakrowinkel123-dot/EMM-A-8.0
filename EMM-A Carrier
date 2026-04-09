@@ -21,6 +21,7 @@ int broadcastIntervalTicks = 10;
 
 bool broadcastingEnabled = true;
 int tickCounter = 0;
+int statusTickCounter = 0;
 
 IMyShipController carrierRc;
 IMyShipConnector carrierConnector;
@@ -37,14 +38,18 @@ public void Main(string argument, UpdateType updateSource)
     if ((updateSource & (UpdateType.Update1 | UpdateType.Update10 | UpdateType.Update100)) != 0)
     {
         tickCounter++;
+        statusTickCounter++;
         if (broadcastingEnabled && tickCounter >= Math.Max(1, broadcastIntervalTicks))
         {
             tickCounter = 0;
             BroadcastDockPose(false);
         }
 
-        if (tickCounter % 60 == 0)
+        if (statusTickCounter >= 60)
+        {
+            statusTickCounter = 0;
             WriteStatus();
+        }
 
         return;
     }
