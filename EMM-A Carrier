@@ -1,0 +1,191 @@
+// Carrier Dock Transponder Script
+//
+// Broadcasts carrier dock pose for miners.
+// Payload format is intentionally compatible with miner `dock;...` command:
+//   dock;GPS:<dockId>:<x>:<y>:<z>:|<ux>,<uy>,<uz>,<fx>,<fy>,<fz>
+//
+// Commands:
+//   start            : enable periodic broadcast
+//   stop             : disable periodic broadcast
+//   send             : broadcast one packet immediately
+//   status           : print current state
+//   dockid <value>   : set dock id used in payload name section
+//   channel <value>  : set IGC broadcast channel tag
+//   interval <ticks> : set send interval in update ticks (>= 1)
+
+string carrierRemoteControlName = "EMM-A Ca Remote Control";
+string carrierConnectorName = "EMM-A Ca Connector";
+string dockId = "Dock nr5";
+string dockChannel = "EMM_A_DOCK";
+int broadcastIntervalTicks = 10;
+
+bool broadcastingEnabled = true;
+int tickCounter = 0;
+
+IMyShipController carrierRc;
+IMyShipConnector carrierConnector;
+
+public Program()
+{
+    Runtime.UpdateFrequency = UpdateFrequency.Update1;
+    ResolveBlocks();
+    Echo("Carrier dock transponder ready.");
+}
+
+public void Main(string argument, UpdateType updateSource)
+{
+    if ((updateSource & (UpdateType.Update1 | UpdateType.Update10 | UpdateType.Update100)) != 0)
+    {
+        tickCounter++;
+        if (broadcastingEnabled && tickCounter >= Math.Max(1, broadcastIntervalTicks))
+        {
+            tickCounter = 0;
+            BroadcastDockPose(false);
+        }
+
+        if (tickCounter % 60 == 0)
+            WriteStatus();
+
+        return;
+    }
+
+    if (!string.IsNullOrWhiteSpace(argument))
+        HandleCommand(argument.Trim());
+}
+
+void HandleCommand(string command)
+{
+    if (command.Equals("start", StringComparison.OrdinalIgnoreCase))
+    {
+        broadcastingEnabled = true;
+        Echo("Broadcasting enabled.");
+        return;
+    }
+
+    if (command.Equals("stop", StringComparison.OrdinalIgnoreCase))
+    {
+        broadcastingEnabled = false;
+        Echo("Broadcasting disabled.");
+        return;
+    }
+
+    if (command.Equals("send", StringComparison.OrdinalIgnoreCase))
+    {
+        BroadcastDockPose(true);
+        return;
+    }
+
+    if (command.Equals("status", StringComparison.OrdinalIgnoreCase))
+    {
+        WriteStatus();
+        return;
+    }
+
+    if (command.StartsWith("dockid ", StringComparison.OrdinalIgnoreCase))
+    {
+        string value = command.Substring(7).Trim();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            Echo("dockid cannot be empty.");
+            return;
+        }
+        dockId = value;
+        Echo($"dockid set to '{dockId}'.");
+        return;
+    }
+
+    if (command.StartsWith("channel ", StringComparison.OrdinalIgnoreCase))
+    {
+        string value = command.Substring(8).Trim();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            Echo("channel cannot be empty.");
+            return;
+        }
+        dockChannel = value;
+        Echo($"channel set to '{dockChannel}'.");
+        return;
+    }
+
+    if (command.StartsWith("interval ", StringComparison.OrdinalIgnoreCase))
+    {
+        int value;
+        if (!int.TryParse(command.Substring(9).Trim(), out value) || value < 1)
+        {
+            Echo("interval must be an integer >= 1.");
+            return;
+        }
+        broadcastIntervalTicks = value;
+        Echo($"interval set to {broadcastIntervalTicks} tick(s).");
+        return;
+    }
+
+    Echo("Unknown command.");
+}
+
+void ResolveBlocks()
+{
+    carrierRc = GridTerminalSystem.GetBlockWithName(carrierRemoteControlName) as IMyShipController;
+    carrierConnector = GridTerminalSystem.GetBlockWithName(carrierConnectorName) as IMyShipConnector;
+}
+
+bool EnsureBlocks()
+{
+    if (carrierRc == null || carrierConnector == null)
+        ResolveBlocks();
+
+    if (carrierRc == null)
+    {
+        Echo($"Missing RC: '{carrierRemoteControlName}'");
+        return false;
+    }
+
+    if (carrierConnector == null)
+    {
+        Echo($"Missing connector: '{carrierConnectorName}'");
+        return false;
+    }
+
+    return true;
+}
+
+void BroadcastDockPose(bool manual)
+{
+    if (!EnsureBlocks())
+        return;
+
+    Vector3D p = carrierConnector.GetPosition();
+    Vector3D up = Vector3D.Normalize(carrierRc.WorldMatrix.Up);
+    Vector3D forward = Vector3D.Normalize(carrierRc.WorldMatrix.Forward);
+
+    string payload =
+        "dock;GPS:" + dockId + ":" +
+        p.X.ToString("0.00") + ":" +
+        p.Y.ToString("0.00") + ":" +
+        p.Z.ToString("0.00") +
+        ":|" +
+        up.X.ToString("0.0000") + "," +
+        up.Y.ToString("0.0000") + "," +
+        up.Z.ToString("0.0000") + "," +
+        forward.X.ToString("0.0000") + "," +
+        forward.Y.ToString("0.0000") + "," +
+        forward.Z.ToString("0.0000");
+
+    IGC.SendBroadcastMessage(dockChannel, payload, TransmissionDistance.AntennaRelay);
+    Echo(manual ? "Manual dock packet broadcasted." : "Dock packet broadcasted.");
+}
+
+void WriteStatus()
+{
+    StringBuilder sb = new StringBuilder();
+    sb.AppendLine("Carrier Dock Transponder");
+    sb.AppendLine($"Enabled: {broadcastingEnabled}");
+    sb.AppendLine($"Channel: {dockChannel}");
+    sb.AppendLine($"Dock ID: {dockId}");
+    sb.AppendLine($"Interval: {broadcastIntervalTicks} tick(s)");
+    sb.AppendLine($"RC: {carrierRemoteControlName}");
+    sb.AppendLine($"Connector: {carrierConnectorName}");
+    if (carrierConnector != null)
+        sb.AppendLine($"Connector status: {carrierConnector.Status}");
+    Echo(sb.ToString());
+}

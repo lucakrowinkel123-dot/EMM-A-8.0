@@ -47,6 +47,7 @@ string carrierRemoteControlName = "EMM-A Ca Remote Control";
 string carrierConnectorName = "EMM-A Ca Connector";
 string minerRemoteControlName = "EMM-A Ma Remote Control";
 string minerConnectorName = "EMM-A Ma Connector";
+string dockChannel = "EMM_A_DOCK";
 // =============================================
 
 IMyShipController rc;
@@ -116,6 +117,7 @@ DockState dockState = DockState.Idle;
 Vector3D dockConnectorPosition = Vector3D.Zero;
 Vector3D dockCarrierUp = Vector3D.Zero;
 IMyShipConnector minerConnector;
+IMyBroadcastListener dockListener;
 Vector3D pathRecordLastPos = Vector3D.Zero;
 int pathRecordCounter = 0;
 int pathRecordMineCounter = 0;
@@ -164,6 +166,7 @@ public Program ()
     gyros = new GyroControl(rc, tickSpeed, GetBlocks<IMyGyro>());
     drills = GetBlocks<IMyShipDrill>();
     minerConnector = GetBlock<IMyShipConnector>(minerConnectorName, true);
+    dockListener = IGC.RegisterBroadcastListener(dockChannel);
 
     if (tickSpeed == UpdateFrequency.Update10)
     { secondsPerTick = 10.0 / 60.0; echoFrequency = 10; }
@@ -197,6 +200,7 @@ public void Main (string argument, UpdateType updateSource)
             UpdateMiningState();
 
         bool usedSoftLock = UpdatePathRecordState();
+        PollDockChannel();
         UpdateDockingState();
 
         if (autopilotEnabled && hasTarget)
@@ -210,6 +214,29 @@ public void Main (string argument, UpdateType updateSource)
     else
     {
         RemoteCommand(argument);
+    }
+}
+
+void PollDockChannel()
+{
+    if (dockListener == null)
+        return;
+
+    while (dockListener.HasPendingMessage)
+    {
+        MyIGCMessage msg = dockListener.AcceptMessage();
+        if (!(msg.Data is string))
+            continue;
+
+        string payload = ((string)msg.Data).Trim();
+        if (string.IsNullOrWhiteSpace(payload))
+            continue;
+
+        if (dockState != DockState.Idle)
+            continue; // ignore new dock assignments while already docking
+
+        if (payload.StartsWith("dock;", StringComparison.OrdinalIgnoreCase))
+            StartDockRun(payload.Substring(5).Trim());
     }
 }
 
