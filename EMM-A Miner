@@ -95,6 +95,9 @@ int pathIndex = 0;
 bool pathRecordingEnabled = false;
 bool pathRecordingPaused = false;
 bool pathRecordingWaitReturn = false;
+bool pathRecordMineRunAreaAfterReturn = false;
+bool pathRecordMineWaitAreaComplete = false;
+string pathRecordMineAreaCommand = "";
 bool cockpitGyroControlForcedOff = false;
 Vector3D pathRecordLastPos = Vector3D.Zero;
 int pathRecordCounter = 0;
@@ -420,6 +423,9 @@ void RemoteCommand (string command)
             pathRecordingEnabled = false;
             pathRecordingPaused = false;
             pathRecordingWaitReturn = false;
+            pathRecordMineRunAreaAfterReturn = false;
+            pathRecordMineWaitAreaComplete = false;
+            pathRecordMineAreaCommand = "";
             pathRecordMineStage = PathRecordMineStage.Idle;
             SetCockpitGyroControl(true);
             activeMaxSpeed = 0;
@@ -528,6 +534,9 @@ void StartPathRecording(string command)
     pathRecordingEnabled = true;
     pathRecordingPaused = false;
     pathRecordingWaitReturn = false;
+    pathRecordMineRunAreaAfterReturn = false;
+    pathRecordMineWaitAreaComplete = false;
+    pathRecordMineAreaCommand = "";
     pathRecordMineStage = PathRecordMineStage.Idle;
     pathRecordLastPos = rc.GetPosition();
     SavePathGpsRecord();
@@ -539,6 +548,9 @@ void StopPathRecording()
     pathRecordingEnabled = false;
     pathRecordingPaused = false;
     pathRecordingWaitReturn = false;
+    pathRecordMineRunAreaAfterReturn = false;
+    pathRecordMineWaitAreaComplete = false;
+    pathRecordMineAreaCommand = "";
     pathRecordMineStage = PathRecordMineStage.Idle;
     SetCockpitGyroControl(true);
     SetMineIndicatorSensor(false);
@@ -547,6 +559,14 @@ void StopPathRecording()
 
 bool UpdatePathRecordState()
 {
+    if (pathRecordMineWaitAreaComplete && !miningEnabled)
+    {
+        pathRecordMineWaitAreaComplete = false;
+        pathRecordingPaused = false;
+        pathRecordLastPos = rc.GetPosition();
+        Echo("PathRecord minearea complete. Path recording resumed.");
+    }
+
     if (pathRecordingEnabled && !pathRecordingPaused && !pathRecordingWaitReturn)
     {
         Vector3D now = rc.GetPosition();
@@ -565,12 +585,30 @@ bool UpdatePathRecordState()
             autopilotEnabled = false;
             hasTarget = false;
             pathRecordingWaitReturn = false;
-            pathRecordingPaused = false;
             pathRecordMineStage = PathRecordMineStage.Idle;
-            pathRecordLastPos = rc.GetPosition();
             SetCockpitGyroControl(true);
             SetMineIndicatorSensor(false);
-            Echo("Returned to mine entry. Path recording resumed.");
+
+            if (pathRecordMineRunAreaAfterReturn && !string.IsNullOrWhiteSpace(pathRecordMineAreaCommand))
+            {
+                pathRecordMineRunAreaAfterReturn = false;
+                pathRecordMineWaitAreaComplete = true;
+                Echo("Returned to mine entry. Starting minearea before resuming path recording...");
+                StartAreaMining(pathRecordMineAreaCommand);
+                if (!miningEnabled)
+                {
+                    pathRecordMineWaitAreaComplete = false;
+                    pathRecordingPaused = false;
+                    pathRecordLastPos = rc.GetPosition();
+                    Echo("Minearea start failed. Path recording resumed.");
+                }
+            }
+            else
+            {
+                pathRecordingPaused = false;
+                pathRecordLastPos = rc.GetPosition();
+                Echo("Returned to mine entry. Path recording resumed.");
+            }
         }
         return false;
     }
@@ -660,8 +698,10 @@ void HandlePathRecordMineStep()
     autopilotEnabled = true;
     activeMaxSpeed = SPEEDB;
     pathRecordingWaitReturn = true;
+    pathRecordMineAreaCommand = "minearea;" + rec;
+    pathRecordMineRunAreaAfterReturn = true;
     pathRecordMineStage = PathRecordMineStage.ReturningToEntry;
-    Echo("Mine area saved. Returning to entry point...");
+    Echo("Mine area saved. Returning to entry point before mining area...");
 }
 
 string FormatCurrentGps(string name)
@@ -1489,6 +1529,9 @@ void SaveState()
     sb.AppendLine("pathRecordingEnabled=" + (pathRecordingEnabled ? "1" : "0"));
     sb.AppendLine("pathRecordingPaused=" + (pathRecordingPaused ? "1" : "0"));
     sb.AppendLine("pathRecordingWaitReturn=" + (pathRecordingWaitReturn ? "1" : "0"));
+    sb.AppendLine("pathRecordMineRunAreaAfterReturn=" + (pathRecordMineRunAreaAfterReturn ? "1" : "0"));
+    sb.AppendLine("pathRecordMineWaitAreaComplete=" + (pathRecordMineWaitAreaComplete ? "1" : "0"));
+    sb.AppendLine("pathRecordMineAreaCommand=" + pathRecordMineAreaCommand);
     sb.AppendLine("pathRecordLastPos=" + V3ToString(pathRecordLastPos));
     sb.AppendLine("pathRecordCounter=" + pathRecordCounter);
     sb.AppendLine("pathRecordMineCounter=" + pathRecordMineCounter);
@@ -1570,6 +1613,9 @@ void LoadState()
     if (dict.TryGetValue("pathRecordingEnabled", out s)) pathRecordingEnabled = s == "1";
     if (dict.TryGetValue("pathRecordingPaused", out s)) pathRecordingPaused = s == "1";
     if (dict.TryGetValue("pathRecordingWaitReturn", out s)) pathRecordingWaitReturn = s == "1";
+    if (dict.TryGetValue("pathRecordMineRunAreaAfterReturn", out s)) pathRecordMineRunAreaAfterReturn = s == "1";
+    if (dict.TryGetValue("pathRecordMineWaitAreaComplete", out s)) pathRecordMineWaitAreaComplete = s == "1";
+    if (dict.TryGetValue("pathRecordMineAreaCommand", out s)) pathRecordMineAreaCommand = s;
     if (dict.TryGetValue("pathRecordLastPos", out s) && TryParseV3(s, out v)) pathRecordLastPos = v;
     if (dict.TryGetValue("pathRecordCounter", out s) && int.TryParse(s, out n)) pathRecordCounter = n;
     if (dict.TryGetValue("pathRecordMineCounter", out s) && int.TryParse(s, out n)) pathRecordMineCounter = n;
