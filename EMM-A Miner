@@ -43,6 +43,9 @@ double pathRecordMeters = 25.0;
 double pathRecordMineDepth = 30.0;
 string pathRecordMineSensorTag = "EMM-A";
 double dockStagingDistance = 50.0; // meters below carrier connector along carrier RC Up axis
+string carrierRemoteControlName = "EMM-A Ca Remote Control";
+string carrierConnectorName = "EMM-A Ca Connector";
+string minerRemoteControlName = "EMM-A Ma Remote Control";
 string minerConnectorName = "EMM-A Ma Connector";
 // =============================================
 
@@ -302,6 +305,10 @@ bool IsOrientationAligned(Vector3D forward, Vector3D up, double toleranceDeg)
 
 void ValidateDockSetup()
 {
+    IMyShipController namedMinerRc = GetBlock<IMyShipController>(minerRemoteControlName, true);
+    if (namedMinerRc == null)
+        Echo($"Dock setup warning: miner RC '{minerRemoteControlName}' not found.");
+
     minerConnector = GetBlock<IMyShipConnector>(minerConnectorName, true);
     if (minerConnector == null)
         Echo($"Dock setup warning: miner connector '{minerConnectorName}' not found.");
